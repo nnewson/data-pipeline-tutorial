@@ -1,0 +1,29 @@
+[build-system]
+requires = ["uv_build>=0.10.9,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "pipeline"
+
+[project]
+name = "data-pipeline-tutorial"
+version = "0.1"
+description = "A step-by-step rebuild of a Kafka, Redis, Cassandra, RabbitMQ, ZooKeeper, Flink and gRPC pipeline"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+# No runtime dependencies yet. The first arrives with Kafka in 0.2.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest", # For testing
+  "ruff",   # For formatting and linting
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.scripts]
+check-web = "pipeline.check_web:main"
+smoke-test = "pipeline.smoke_test:main"

@@ -1,0 +1,43 @@
+# The system as it stands at 0.1: one service to talk to, and one container to
+# talk to it from. Both are scaffolding. 0.2 removes `web` and puts Kafka in the
+# slot it is holding.
+
+services:
+
+  # A throwaway HTTP service. It exists to be reachable, and to be reachable by
+  # two different addresses depending on where you are standing.
+  web:
+    # Pinned to a readable version rather than a floating `alpine` tag, so a
+    # reader cloning this tag later gets the nginx this release was written
+    # against.
+    image: nginx:1.31-alpine
+    ports:
+      # host:container. Published on the host as localhost:8080; inside the
+      # Compose network it is still port 80, at the hostname `web`.
+      - "8080:80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost/"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # A container inside the Compose network, with the project mounted, for
+  # running the same code from the other side of the boundary.
+  shell:
+    image: ghcr.io/astral-sh/uv:0.9.30-python3.12-bookworm-slim
+    depends_on:
+      web:
+        # Wait for the healthcheck to pass, not merely for the container to
+        # start. A started container is not necessarily a ready one.
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    environment:
+      # The same service, addressed from inside the network.
+      WEB_URL: http://web
+      # Keep the container's virtualenv out of the mounted tree, so it does not
+      # collide with the host's .venv built for a different platform.
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    command: sleep infinity
