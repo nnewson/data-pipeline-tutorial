@@ -1,43 +1,76 @@
-# The system as it stands at 0.1: one service to talk to, and one container to
-# talk to it from. Both are scaffolding. 0.2 removes `web` and puts Kafka in the
-# slot it is holding.
+# The system as it stands at 0.2: a Kafka broker, and nothing else. Application
+# processes — the producer and consumer — run on the host, against it.
+#
+# 0.1's throwaway `web` and `shell` services are gone. Kafka's own image carries
+# the CLI tools this release needs, which is the pattern from here on.
 
 services:
 
-  # A throwaway HTTP service. It exists to be reachable, and to be reachable by
-  # two different addresses depending on where you are standing.
-  web:
-    # Pinned to a readable version rather than a floating `alpine` tag, so a
-    # reader cloning this tag later gets the nginx this release was written
-    # against.
-    image: nginx:1.31-alpine
+  kafka:
+    # Pinned to a readable version. Kafka 4.x is KRaft-only: ZooKeeper mode was
+    # deprecated in 3.5 and removed in 4.0.
+    image: apache/kafka:4.3.1
     ports:
-      # host:container. Published on the host as localhost:8080; inside the
-      # Compose network it is still port 80, at the hostname `web`.
-      - "8080:80"
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost/"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-
-  # A container inside the Compose network, with the project mounted, for
-  # running the same code from the other side of the boundary.
-  shell:
-    image: ghcr.io/astral-sh/uv:0.9.30-python3.12-bookworm-slim
-    depends_on:
-      web:
-        # Wait for the healthcheck to pass, not merely for the container to
-        # start. A started container is not necessarily a ready one.
-        condition: service_healthy
-    volumes:
-      - ./:/workspace
-    working_dir: /workspace
+      # Only the host listener is published. The internal one does not need to
+      # be, because nothing outside the Compose network uses it.
+      - "9092:9092"
     environment:
-      # The same service, addressed from inside the network.
-      WEB_URL: http://web
-      # Keep the container's virtualenv out of the mounted tree, so it does not
-      # collide with the host's .venv built for a different platform.
-      UV_PROJECT_ENVIRONMENT: /opt/venv
-    command: sleep infinity
+      # KRaft: this one node plays both roles. The controller quorum elects an
+      # active controller from among the controller nodes, and brokers register
+      # with it — here that quorum is a single voter electing this node, which
+      # then registers with itself. Fine for local development, and explicitly
+      # not production, where controllers are separate nodes and the quorum has
+      # somewhere to fail over to.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Three listeners doing three jobs: one for host processes, one for other
+      # containers, one for the controller quorum talking to itself.
+      KAFKA_LISTENERS: PLAINTEXT_HOST://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT_HOST:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+
+      # The addresses the broker hands back to clients on connection. This is
+      # 0.1's lesson made load-bearing: a client is told where to go next, so
+      # the advertised address has to be correct from that client's position.
+      # Get this wrong and the broker is reachable but every produce fails.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_HOST://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+
+      # Single node, so nothing can be replicated anywhere.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # One partition for now. 0.3 is about what changes when this is four.
+      KAFKA_NUM_PARTITIONS: 1
+
+      # Skip the rebalance delay that would otherwise stall a consumer joining
+      # a group for several seconds.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # The image's default log.dirs points at /tmp, and the volume it declares
+      # at /var/lib/kafka/data is left empty. Pointing Kafka at that path is
+      # what makes the named volume below do anything at all.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+      # KRaft stores cluster metadata in its own log, and that log needs an
+      # identity before first start. The image formats storage using this.
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    volumes:
+      # Without this the log and its committed offsets live in the container,
+      # and `docker compose down` discards both — which would quietly falsify
+      # the durability the README demonstrates.
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Healthy means the broker answers an API request, not merely that the
+      # process started.
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  kafka-data:
