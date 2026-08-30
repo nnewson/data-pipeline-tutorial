@@ -6,8 +6,9 @@ on:
     branches:
       - main
     tags:
-      # Releases are the product of this repository, so a tag push is gated by
-      # the same checks a branch push is.
+      # Releases are the product of this repository, so the same checks run on
+      # a tag push as on a branch push. A workflow cannot prevent a tag from
+      # existing; publishing the release after they pass is the actual gate.
       - "*"
 
 jobs:

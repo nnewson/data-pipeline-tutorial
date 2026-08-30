@@ -7,13 +7,15 @@ module-name = "pipeline"
 
 [project]
 name = "data-pipeline-tutorial"
-version = "0.1"
+version = "0.2"
 description = "A step-by-step rebuild of a Kafka, Redis, Cassandra, RabbitMQ, ZooKeeper, Flink and gRPC pipeline"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 
-# No runtime dependencies yet. The first arrives with Kafka in 0.2.
-dependencies = []
+dependencies = [
+  "kafka-python",    # Kafka client
+  "faker",           # Synthetic event data
+]
 
 [project.optional-dependencies]
 dev = [
@@ -21,9 +23,24 @@ dev = [
   "ruff",   # For formatting and linting
 ]
 
+[tool.ruff.lint]
+# Selected explicitly rather than inherited from whatever the installed Ruff
+# happens to default to. uv.lock pins the version, so a tag cannot spontaneously
+# acquire new rules — but refreshing Ruff in a later release would otherwise
+# change this project's lint policy silently.
+select = [
+  "E4", "E7", "E9", # pycodestyle: imports, statements, syntax
+  "F",              # pyflakes
+  "I",              # import ordering
+  "B",              # bugbear
+  "BLE",            # no blind except
+  "UP",             # modern syntax for the pinned Python
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [project.scripts]
-check-web = "pipeline.check_web:main"
+producer = "pipeline.producer:main"
+consumer = "pipeline.kafka_consumer:main"
 smoke-test = "pipeline.smoke_test:main"

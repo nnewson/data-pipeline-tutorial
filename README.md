@@ -4,20 +4,17 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-Each tag is a working system.
-
-**This release: 0.1 — Docker Compose.** No pipeline yet. This release
-establishes the build toolchain and the orchestration vocabulary the rest of the
-tutorial assumes, and it introduces one idea that everything after it depends
-on: a service has one address from the host and a different one from inside the
-Compose network.
+**This release: 0.2 — Kafka.** A producer generates synthetic pageviews, a
+broker keeps them in a log, and a consumer reads them back. One topic, one
+partition. 0.1's throwaway `web` and `shell` services are gone; Kafka's own
+image carries the CLI tools this release needs.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.1
+git checkout 0.2
 ```
 
 ## Prerequisites
@@ -33,76 +30,119 @@ uv sync --all-extras
 docker compose up -d --wait
 ```
 
-`--wait` blocks until every service with a healthcheck reports healthy, so a
-successful return means the topology is ready rather than merely started.
-`shell` waits for `web`'s healthcheck to pass before it starts at all.
+`--wait` blocks until the broker answers an API request, not merely until the
+container starts.
+
+## Running the pipeline
+
+Two terminals, because these are two long-running host processes. Producer
+first:
+
+```bash
+uv run producer
+```
 
 ```text
-                    host
-   ┌──────────────────────────────────────────┐
-   │  uv run check-web                        │
-   │  WEB_URL=http://localhost:8080           │
-   └───────────────────┬──────────────────────┘
-                       │  published port 8080 -> 80
-   ┌───────────────────┴──────────────────────┐
-   │            Compose network               │
-   │                                          │
-   │   shell ───── http://web:80 ─────► web   │
-   │   WEB_URL=http://web                     │
-   └──────────────────────────────────────────┘
+INFO pipeline: Created topic pageviews with 1 partition(s)
+INFO producer: Produced (partition 0, offset 0): {'event_id': '...', 'page': '/', ...}
+INFO producer: Produced (partition 0, offset 1): {'event_id': '...', 'page': '/docs', ...}
 ```
 
-## One service, two addresses
+The producer declares the topic before writing to it. That is transitional: the
+broker still has auto-creation enabled, so declaring is belt-and-braces rather
+than ownership, and the two can still race. It is here because without it the
+first documented run logs `ERROR ... Topic pageviews not found in cluster
+metadata` — which is not a fault, but reads exactly like one. 0.3 takes real
+ownership of topic lifecycle, disables auto-creation, and changes the partition
+count.
 
-From the host, `web` is published on port 8080:
+The partition and offset are reported because the producer waits for the broker
+to acknowledge each record before logging it. `send()` is asynchronous and
+returns a future; logging without resolving it would claim a delivery that might
+still fail. At one event per second that wait costs nothing, and it means the
+line you are reading is a fact rather than an intention.
+
+Then, in a second terminal:
 
 ```bash
-curl http://localhost:8080
-uv run check-web
+uv run consumer
 ```
 
-From inside the Compose network it is not on port 8080 at all. It is the
-hostname `web`, on port 80:
+```text
+INFO consumer: Consumed (partition 0, offset 0): {'event_id': '...', ...}
+INFO consumer: Consumed (partition 0, offset 1): {'event_id': '...', ...}
+```
+
+The consumer starts at offset 0 rather than at the end, because the log is
+durable and `auto_offset_reset="earliest"` asks for everything still retained.
+Stop it, restart it, and it resumes from its committed offset instead — the log
+is not a queue, and reading does not consume.
+
+On a brand new cluster the consumer logs `NotCoordinatorError` once or twice
+before settling. That is Kafka creating the internal offsets topic for the first
+consumer group that asks for it; the retry succeeds and later runs are silent.
+
+Two terminals is already mildly annoying. 0.3 adds three more consumers and
+introduces a Procfile so the whole topology starts as one command.
+
+## The log outlives the container
+
+The broker writes to a named volume, so the log and its committed offsets
+survive the container being replaced:
 
 ```bash
-docker compose exec shell uv run check-web
+uv run producer          # produce a few events, then stop it
+docker compose down      # note: no --volumes
+docker compose up -d --wait
+uv run consumer          # the earlier events are still there
 ```
 
-There is no `curl` in there to compare against. The `shell` image is a minimal
-one and ships a Python toolchain, nothing else — which is the normal case, and
-worth meeting early. Later releases reach for each service's own image when they
-need a CLI, rather than expecting one container to carry them all.
+This needs two things, not one. The image declares a volume at
+`/var/lib/kafka/data` but defaults `log.dirs` to `/tmp`, so mounting the volume
+alone persists nothing — `KAFKA_LOG_DIRS` has to point Kafka at it. Use
+`docker compose down --volumes` to start genuinely clean.
 
-Same service, same code, different address. `check-web` prints whichever one it
-was told to use, because `WEB_URL` defaults to the host address and
-`docker-compose.yml` overrides it for the container.
+## Two addresses, one broker
 
-This matters more than it looks. In 0.2 Kafka is configured with two listeners
-for exactly this reason — host processes reach it one way, containers reach it
-another — and that configuration is opaque until you have seen the simple
-version.
+0.1 established that a service has one address from the host and another from
+inside the Compose network. Kafka makes that structural rather than incidental,
+because a broker *tells clients where to go next*:
 
-## Getting inside a running system
+```yaml
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_HOST://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+```
 
-Two ways in, both used throughout the tutorial:
+A client connects to a bootstrap address, and the broker replies with the
+address it advertises for that listener. The client then connects *there*. So a
+wrong advertised address fails in a particular way: the connection succeeds and
+every produce afterwards fails, because the client was handed somewhere it
+cannot reach.
+
+Host processes use `localhost:9092`. Containers use `kafka:29092` — nothing does
+yet, but Flink will at 0.10, and the smoke test proves the path works now.
 
 ```bash
-docker compose exec shell bash          # into the container that is already running
-docker compose run --rm shell bash      # a fresh one-off container, removed on exit
+# From the host
+uv run smoke-test
+
+# The internal address, from inside the network
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --list
 ```
 
-Later releases lean on this constantly — loading a Cassandra schema, listing
-Kafka topics, reading Redis keys — using each service's own image and CLI.
+## KRaft, and where ZooKeeper went
 
-## Shutting down
+Kafka 4.x runs KRaft only: ZooKeeper mode was deprecated in 3.5 and removed in
+4.0. This single node is both broker and controller, which is fine for local
+development and explicitly not a production topology, where controllers are
+separate nodes.
 
-```bash
-docker compose down
-```
+ZooKeeper still appears in this tutorial, at 0.7 — coordinating the pipeline's
+own processes, which is a different job from storing Kafka's metadata.
 
 ## Testing
 
-Unit tests need no containers.
+Unit tests need no broker.
 
 ```bash
 uv run ruff check .
@@ -111,7 +151,7 @@ uv run pytest
 ```
 
 The smoke test does. It asserts both addressing paths against the running
-topology, and is the same check CI runs.
+broker, and is the same check CI runs.
 
 ```bash
 docker compose up -d --wait
@@ -120,10 +160,10 @@ docker compose down
 ```
 
 ```text
-PASS  host path: http://localhost:8080 served 200
-PASS  container path: http://web served 200 from inside the network
+PASS  host listener: produced and consumed via localhost:9092
+PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 
-all 2 checks passed
+all 2 checks passed in 2.5s
 ```
 
 CI runs these as two jobs. `quality` covers linting, formatting, unit tests and
@@ -135,11 +175,13 @@ published only after both tag workflows pass.
 ## Project structure
 
 ```text
-docker-compose.yml       web (throwaway HTTP service) and shell
+docker-compose.yml       a single Kafka broker in KRaft mode
 src/pipeline/
+    __init__.py          logging setup and connection retry
     config.py            environment-driven settings, host addresses by default
-    check_web.py         fetches WEB_URL and reports what answered
-    smoke_test.py        bounded assertions against a running topology
+    producer.py          declares the topic, then produces acknowledged events
+    kafka_consumer.py    reads them back, logging partition and offset
+    smoke_test.py        bounded assertions against a running broker
 tests/
 ```
 
