@@ -4,8 +4,7 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-Each tag is a working system. See [roadmap.md](roadmap.md) for the full
-sequence.
+Each tag is a working system.
 
 **This release: 0.1 — Docker Compose.** No pipeline yet. This release
 establishes the build toolchain and the orchestration vocabulary the rest of the
