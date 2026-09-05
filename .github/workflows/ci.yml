@@ -52,7 +52,7 @@ jobs:
     # The smoke test bounds its own checks, but image pulls and `compose up
     # --wait` sit outside those. Without this, GitHub's 360-minute default is
     # the real bound.
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -76,7 +76,12 @@ jobs:
         # so readiness is asserted rather than slept through.
         run: docker compose up -d --wait
 
+      - name: Create topics
+        # The defined topic-management path, exercised as a reader would.
+        run: uv run create-topics
+
       - name: Smoke test
+        # Includes starting the real Procfile topology and stopping it again.
         run: uv run smoke-test
 
       - name: Show container logs on failure

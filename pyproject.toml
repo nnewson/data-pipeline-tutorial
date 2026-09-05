@@ -7,7 +7,7 @@ module-name = "pipeline"
 
 [project]
 name = "data-pipeline-tutorial"
-version = "0.2"
+version = "0.3"
 description = "A step-by-step rebuild of a Kafka, Redis, Cassandra, RabbitMQ, ZooKeeper, Flink and gRPC pipeline"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -21,6 +21,7 @@ dependencies = [
 dev = [
   "pytest", # For testing
   "ruff",   # For formatting and linting
+  "honcho", # Runs the Procfile topology
 ]
 
 [tool.ruff.lint]
@@ -41,6 +42,7 @@ select = [
 testpaths = ["tests"]
 
 [project.scripts]
+create-topics = "pipeline.topics:main"
 producer = "pipeline.producer:main"
 consumer = "pipeline.kafka_consumer:main"
 smoke-test = "pipeline.smoke_test:main"

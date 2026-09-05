@@ -43,8 +43,10 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
-      # One partition for now. 0.3 is about what changes when this is four.
-      KAFKA_NUM_PARTITIONS: 1
+      # Topics are created deliberately by `uv run create-topics`, not invented
+      # by whichever client asks for one first. A client that auto-creates a
+      # topic picks the partition count by accident.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
 
       # Skip the rebalance delay that would otherwise stall a consumer joining
       # a group for several seconds.

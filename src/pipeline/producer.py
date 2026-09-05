@@ -6,7 +6,7 @@ import uuid
 from faker import Faker
 from kafka import KafkaProducer
 
-from pipeline import ensure_topic, wait_for_connection
+from pipeline import get_partition, wait_for_connection, wait_for_topic
 from pipeline.config import (
     KAFKA_PARTITIONS,
     KAFKA_SERVER,
@@ -53,7 +53,12 @@ def produce_forever(producer: KafkaProducer, fake: Faker) -> None:
         # returns a future, so logging without get() would report a delivery
         # that may still fail. At one event per second, waiting costs nothing
         # and the reported partition and offset are then facts.
-        metadata = producer.send(KAFKA_TOPIC, event).get(timeout=ACK_TIMEOUT_SECONDS)
+        # Routed explicitly rather than left to the default partitioner, so
+        # the rule is visible in the code and every partition is exercised.
+        partition = get_partition(event["user_id"], KAFKA_PARTITIONS)
+        metadata = producer.send(KAFKA_TOPIC, event, partition=partition).get(
+            timeout=ACK_TIMEOUT_SECONDS
+        )
         logger.info(
             f"Produced (partition {metadata.partition}, "
             f"offset {metadata.offset}): {event}"
@@ -62,7 +67,7 @@ def produce_forever(producer: KafkaProducer, fake: Faker) -> None:
 
 
 def main() -> int:
-    ensure_topic(KAFKA_TOPIC, KAFKA_PARTITIONS, KAFKA_SERVER)
+    wait_for_topic(KAFKA_TOPIC, KAFKA_SERVER)
     producer = connect()
     try:
         produce_forever(producer, Faker())
