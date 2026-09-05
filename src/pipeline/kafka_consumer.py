@@ -1,16 +1,23 @@
 import json
 import logging
+import os
 
 from kafka import KafkaConsumer
 
-from pipeline import wait_for_connection
-from pipeline.config import KAFKA_SERVER, KAFKA_TOPIC
+from pipeline import wait_for_connection, wait_for_topic
+from pipeline.config import (
+    COMMIT_EVERY,
+    CONSUMER_CRASH_AFTER,
+    CONSUMER_GROUP,
+    KAFKA_SERVER,
+    KAFKA_TOPIC,
+)
 
 logger = logging.getLogger("consumer")
 
-# One group, so that adding consumers in 0.3 divides the work rather than
-# duplicating it.
-CONSUMER_GROUP = "pipeline"
+# One group, so the four consumers divide the partitions rather than each
+# receiving every event. Its name comes from config, so a smoke run can isolate
+# itself from a topology that is already running.
 
 
 def connect() -> KafkaConsumer:
@@ -20,23 +27,55 @@ def connect() -> KafkaConsumer:
             KAFKA_TOPIC,
             bootstrap_servers=KAFKA_SERVER,
             group_id=CONSUMER_GROUP,
-            # Without this a new group starts at the end of the log and appears
-            # to do nothing until the next event is produced.
             auto_offset_reset="earliest",
+            # Committing on a timer would make the replay window invisible and
+            # non-deterministic. Committing explicitly makes "how much work can
+            # be repeated" a number this code chooses.
+            enable_auto_commit=False,
             value_deserializer=lambda value: json.loads(value.decode("utf-8")),
         ),
     )
 
 
-def consume_forever(consumer: KafkaConsumer) -> None:
+def handle(message) -> None:
+    """The work. Replacing this log line with a side effect is the whole of 0.4."""
+    logger.info(
+        f"Consumed (partition {message.partition}, offset {message.offset}): "
+        f"{message.value}"
+    )
+
+
+def consume_forever(
+    consumer: KafkaConsumer,
+    commit_every: int = COMMIT_EVERY,
+    crash_after: int | None = CONSUMER_CRASH_AFTER,
+) -> None:
+    processed = 0
     for message in consumer:
-        logger.info(
-            f"Consumed (partition {message.partition}, offset {message.offset}): "
-            f"{message.value}"
-        )
+        handle(message)
+        processed += 1
+
+        # The work happened before the commit, so a crash here replays it.
+        # Committing first would lose it instead — at-most-once rather than
+        # at-least-once. Neither option is "no duplicates and no loss".
+        if crash_after is not None and processed >= crash_after:
+            # Not processed % commit_every: crashing exactly on a boundary
+            # leaves a full batch pending, not zero.
+            uncommitted = ((processed - 1) % commit_every) + 1
+            logger.warning(
+                f"Injected crash after {processed} messages with "
+                f"{uncommitted} uncommitted"
+            )
+            # os._exit skips cleanup, so nothing gets committed on the way out.
+            os._exit(1)
+
+        if processed % commit_every == 0:
+            consumer.commit()
+            logger.info(f"Committed offsets after {processed} messages")
 
 
 def main() -> int:
+    wait_for_topic(KAFKA_TOPIC, KAFKA_SERVER)
     consumer = connect()
     try:
         consume_forever(consumer)

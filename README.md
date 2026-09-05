@@ -4,17 +4,18 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.2 — Kafka.** A producer generates synthetic pageviews, a
-broker keeps them in a log, and a consumer reads them back. One topic, one
-partition. 0.1's throwaway `web` and `shell` services are gone; Kafka's own
-image carries the CLI tools this release needs.
+**This release: 0.3 — Kafka partitioning.** The topic gains four partitions and
+four consumers share them. Topics are now created deliberately rather than
+auto-created, the whole topology starts with one command, and offsets are
+committed explicitly — which is what makes at-least-once delivery something you
+can watch rather than read about.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.2
+git checkout 0.3
 ```
 
 ## Prerequisites
@@ -35,55 +36,112 @@ container starts.
 
 ## Running the pipeline
 
-Two terminals, because these are two long-running host processes. Producer
-first:
+Create the topic first. Nothing else creates it — auto-creation is disabled on
+the broker, so a topic's partition count is a decision rather than an accident:
 
 ```bash
-uv run producer
+uv run create-topics
 ```
 
 ```text
-INFO pipeline: Created topic pageviews with 1 partition(s)
-INFO producer: Produced (partition 0, offset 0): {'event_id': '...', 'page': '/', ...}
-INFO producer: Produced (partition 0, offset 1): {'event_id': '...', 'page': '/docs', ...}
+INFO pipeline: Created topic pageviews with 4 partition(s)
 ```
 
-The producer declares the topic before writing to it. That is transitional: the
-broker still has auto-creation enabled, so declaring is belt-and-braces rather
-than ownership, and the two can still race. It is here because without it the
-first documented run logs `ERROR ... Topic pageviews not found in cluster
-metadata` — which is not a fault, but reads exactly like one. 0.3 takes real
-ownership of topic lifecycle, disables auto-creation, and changes the partition
-count.
-
-The partition and offset are reported because the producer waits for the broker
-to acknowledge each record before logging it. `send()` is asynchronous and
-returns a future; logging without resolving it would claim a delivery that might
-still fail. At one event per second that wait costs nothing, and it means the
-line you are reading is a fact rather than an intention.
-
-Then, in a second terminal:
+Then start everything — a producer and four consumers:
 
 ```bash
-uv run consumer
+uv run honcho start
 ```
 
 ```text
-INFO consumer: Consumed (partition 0, offset 0): {'event_id': '...', ...}
-INFO consumer: Consumed (partition 0, offset 1): {'event_id': '...', ...}
+consumer_3.1 | INFO consumer: Consumed (partition 2, offset 0): {'user_id': 'ssingh', ...}
+consumer_1.1 | INFO consumer: Consumed (partition 0, offset 0): {'user_id': 'daniel60', ...}
+consumer_4.1 | INFO consumer: Committed offsets after 5 messages
 ```
 
-The consumer starts at offset 0 rather than at the end, because the log is
-durable and `auto_offset_reset="earliest"` asks for everything still retained.
-Stop it, restart it, and it resumes from its committed offset instead — the log
-is not a queue, and reading does not consume.
+Four consumers in one group, four partitions, so each consumer gets exactly one.
+Add a fifth and it sits idle: a partition has at most one consumer in a group,
+which is the ceiling on how far a group can scale.
 
-On a brand new cluster the consumer logs `NotCoordinatorError` once or twice
-before settling. That is Kafka creating the internal offsets topic for the first
-consumer group that asks for it; the retry succeeds and later runs are silent.
+If you start a consumer before the topic exists it waits and tells you what to
+run, rather than looping on a metadata error.
 
-Two terminals is already mildly annoying. 0.3 adds three more consumers and
-introduces a Procfile so the whole topology starts as one command.
+If you are carrying a volume over from 0.2, `create-topics` expands the existing
+one-partition topic to four rather than leaving it as it found it. Without that
+the producer would address partitions that do not exist. Your 0.2 events are
+kept; they all live on partition 0, because that is the only partition they
+could have been written to.
+
+## Which partition, and why it matters
+
+The producer routes on the first letter of the username:
+
+```python
+partition = get_partition(event["user_id"], KAFKA_PARTITIONS)
+```
+
+The rule itself is arbitrary. The property it buys is not: **the same user always
+lands on the same partition**, and Kafka guarantees order within a partition. So
+one user's events stay in order relative to each other, while unrelated users
+process in parallel. Ordering is per-partition, never across the topic.
+
+The cost is visible immediately — a real run gave 38, 37, 28 and 12 events to the
+four partitions. Usernames are not uniform across the alphabet, so this key
+produces skew, and the busiest partition sets the pace. Choosing a partition key
+is choosing both your ordering guarantee and your load balance.
+
+## Offsets, and what a crash repeats
+
+Offsets are committed explicitly, every `COMMIT_EVERY` messages:
+
+```python
+handle(message)  # the work happens first
+processed += 1
+if processed % commit_every == 0:
+    consumer.commit()  # then the offset moves
+```
+
+Work first, commit second. If the consumer dies in between, the work is repeated
+on restart — **at-least-once**. Commit first and the work is lost instead —
+at-most-once. Without a transaction joining the work to its offset, commit
+timing chooses between possible loss and possible duplication. Kafka
+transactions and idempotent sinks can close that gap; later releases take the
+second route, making replay harmless rather than preventing it.
+
+Watch it happen. **Stop the Honcho topology first** — four consumers already
+hold the four partitions, and a fifth in the same group would sit idle and never
+reach the crash. Let the producer build a backlog, then stop everything:
+
+```bash
+uv run honcho start          # let it run for a few seconds
+# Ctrl-C to stop the whole topology
+```
+
+Now run a single consumer that dies with work uncommitted:
+
+```bash
+COMMIT_EVERY=5 CONSUMER_CRASH_AFTER=3 uv run consumer
+```
+
+```text
+INFO consumer: Consumed (partition 2, offset 0)
+INFO consumer: Consumed (partition 2, offset 1)
+INFO consumer: Consumed (partition 2, offset 2)
+WARNING consumer: Injected crash after 3 messages with 3 uncommitted
+```
+
+Three processed, none committed. Start one consumer again — still the only
+member of the group — and those exact offsets come back:
+
+```text
+INFO consumer: Consumed (partition 2, offset 0)
+INFO consumer: Consumed (partition 2, offset 1)
+INFO consumer: Consumed (partition 2, offset 2)
+```
+
+Here that costs a repeated log line. At 0.4 the consumer increments a Redis
+counter, and the same replay overcounts — because `INCR` is atomic but not
+idempotent. That is the release where this stops being theoretical.
 
 ## The log outlives the container
 
@@ -162,9 +220,26 @@ docker compose down
 ```text
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
+PASS  partition routing: all 4 partitions addressed by the routing rule
+PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_a2b4cf0d, committed offsets advanced 107 to 326, and nothing was left running
 
-all 2 checks passed in 2.5s
+all 4 checks passed in 21.7s
 ```
+
+On a brand new cluster you will also see `NotCoordinatorError` once or twice
+above these lines, for the same reason a first consumer does: Kafka is creating
+the internal offsets topic for the first group that asks for it. It retries and
+settles, and a second run is quiet.
+
+The last check starts the real Procfile topology, waits for four group members to
+own four partitions, confirms committed offsets advance, and stops it again. The
+other three build their own clients, so they would all pass with a broken
+Procfile.
+
+It runs against a topic and consumer group created for that run alone, handed to
+Honcho through the environment. Sharing `pageviews` and the `pipeline` group
+would let a topology you happen to have running satisfy the check — and a live
+`honcho` process is not evidence that the members being observed are its own.
 
 CI runs these as two jobs. `quality` covers linting, formatting, unit tests and
 Compose parsing; `integration` starts the real topology and runs the smoke test.
@@ -179,10 +254,12 @@ docker-compose.yml       a single Kafka broker in KRaft mode
 src/pipeline/
     __init__.py          logging setup and connection retry
     config.py            environment-driven settings, host addresses by default
-    producer.py          declares the topic, then produces acknowledged events
-    kafka_consumer.py    reads them back, logging partition and offset
+    topics.py            the one path that creates topics
+    producer.py          routes events to partitions by username
+    kafka_consumer.py    reads them back, committing offsets explicitly
     smoke_test.py        bounded assertions against a running broker
 tests/
+Procfile                 the processes that make up the running system
 ```
 
 `config.py` grows an entry per technology as the tutorial proceeds. It is the
