@@ -4,18 +4,17 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.3 — Kafka partitioning.** The topic gains four partitions and
-four consumers share them. Topics are now created deliberately rather than
-auto-created, the whole topology starts with one command, and offsets are
-committed explicitly — which is what makes at-least-once delivery something you
-can watch rather than read about.
+**This release: 0.4 — Redis.** The consumers stop logging events and start
+applying them: a counter per page, a last-page value per user. That turns 0.3's
+at-least-once delivery from a property into a consequence — one of those two
+writes survives a replay intact, and the other does not.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.3
+git checkout 0.4
 ```
 
 ## Prerequisites
@@ -66,6 +65,13 @@ which is the ceiling on how far a group can scale.
 If you start a consumer before the topic exists it waits and tells you what to
 run, rather than looping on a metadata error.
 
+While it runs, the counters climb:
+
+```bash
+uv run counters
+docker compose exec redis redis-cli --scan --pattern 'pageviews:*'
+```
+
 If you are carrying a volume over from 0.2, `create-topics` expands the existing
 one-partition topic to four rather than leaving it as it found it. Without that
 the producer would address partitions that do not exist. Your 0.2 events are
@@ -90,58 +96,140 @@ four partitions. Usernames are not uniform across the alphabet, so this key
 produces skew, and the busiest partition sets the pace. Choosing a partition key
 is choosing both your ordering guarantee and your load balance.
 
-## Offsets, and what a crash repeats
+## Two writes, one replay
 
-Offsets are committed explicitly, every `COMMIT_EVERY` messages:
+The consumer applies each event to Redis before committing its offset:
 
 ```python
-handle(message)  # the work happens first
-processed += 1
-if processed % commit_every == 0:
-    consumer.commit()  # then the offset moves
+client.incr(page_count_key(event["page"]))  # not idempotent
+client.set(last_page_key(event["user_id"]), event["page"])  # idempotent
 ```
 
-Work first, commit second. If the consumer dies in between, the work is repeated
-on restart — **at-least-once**. Commit first and the work is lost instead —
-at-most-once. Without a transaction joining the work to its offset, commit
-timing chooses between possible loss and possible duplication. Kafka
-transactions and idempotent sinks can close that gap; later releases take the
-second route, making replay harmless rather than preventing it.
+`INCR` is **atomic but not idempotent**, and those are different properties.
+Atomicity is what makes four consumers safe to increment the same counter
+concurrently — Redis executes an individual `INCR` atomically by serialising
+normal command execution, so two increments cannot interleave. Idempotency would
+make a *replayed* event safe, and `INCR` does not offer it.
 
-Watch it happen. **Stop the Honcho topology first** — four consumers already
-hold the four partitions, and a fifth in the same group would sit idle and never
-reach the crash. Let the producer build a backlog, then stop everything:
+`SET` is last-writer-wins. Apply the same event twice and the value is
+unchanged, so it converges. That holds here because 0.3's routing rule keeps one
+user's events on one partition, in order — the partitioning release is
+load-bearing for this claim.
+
+The pair is not atomic even though each write is. The injected crash below
+happens after both, which keeps the demonstration about replay; a real crash
+between them would leave partial state.
+
+## Watching a replay corrupt a counter
+
+Start clean, and produce an exact number of events:
 
 ```bash
-uv run honcho start          # let it run for a few seconds
-# Ctrl-C to stop the whole topology
+docker compose down --volumes && docker compose up -d --wait
+uv run create-topics
+uv run producer --count 20
 ```
 
-Now run a single consumer that dies with work uncommitted:
+Run one consumer that dies with work uncommitted:
 
 ```bash
 COMMIT_EVERY=5 CONSUMER_CRASH_AFTER=3 uv run consumer
 ```
 
 ```text
-INFO consumer: Consumed (partition 2, offset 0)
-INFO consumer: Consumed (partition 2, offset 1)
-INFO consumer: Consumed (partition 2, offset 2)
 WARNING consumer: Injected crash after 3 messages with 3 uncommitted
 ```
 
-Three processed, none committed. Start one consumer again — still the only
-member of the group — and those exact offsets come back:
+Now run a consumer again and wait for `Committed offsets after 20 messages`
+before stopping it. Watching the counters is not enough on its own — they can
+reach their final value just before the last commit.
 
-```text
-INFO consumer: Consumed (partition 2, offset 0)
-INFO consumer: Consumed (partition 2, offset 1)
-INFO consumer: Consumed (partition 2, offset 2)
+```bash
+COMMIT_EVERY=5 uv run consumer
+uv run counters
 ```
 
-Here that costs a repeated log line. At 0.4 the consumer increments a Redis
-counter, and the same replay overcounts — because `INCR` is atomic but not
-idempotent. That is the release where this stops being theoretical.
+```text
+  /          4
+  /checkout  2
+  /docs      12
+  /pricing   5
+
+  total      23
+  users tracked  20
+```
+
+**Twenty events produced, twenty-three counted.** The three that were processed
+before the crash were never committed, so they were delivered again — and
+counted again.
+
+`users tracked` is 20 in this run and, more to the point, **unchanged by the
+replay**: the same three events applied twice left every last-page value exactly
+as it was. That number is not guaranteed to be 20 — the generator draws random
+usernames and occasionally repeats one — so compare it before and after the
+replay rather than expecting a particular figure. The counter total is the
+deterministic half.
+
+A fix exists and this release does not build it: retries become harmless when a
+write is keyed by stable event identity. Resist reaching for `SET NX` on the
+event id followed by `INCR` — those two commands are each atomic but not atomic
+*together*, which is the trap this release is about. A Redis-native answer needs
+`SADD`/`SCARD`, or a Lua script doing dedupe-and-increment in one step. 0.5
+supplies a concrete idempotent write instead.
+
+## Derived state, and rebuilding it
+
+Redis runs with persistence off:
+
+```yaml
+command: redis-server --save "" --appendonly no
+```
+
+That is deliberate, and worth being mechanical about. The image declares no
+volume, but RDB snapshotting is *on* by default, so without that command Redis
+would write snapshots into its own filesystem and survive a restart. Counters
+here are derived state — the Kafka log is the record, and Redis is a view of it.
+Kafka gets a named volume; Redis does not.
+
+Rebuilding is not automatic, though. Restart Redis and the counters are gone;
+restart the pipeline and they stay gone, because the consumer group resumes from
+its committed offsets and replays nothing:
+
+```bash
+docker compose restart redis
+uv run consumer          # consumes nothing, counters stay empty
+```
+
+To actually rebuild, quiesce everything — **the producer too** — then reset the
+group and replay:
+
+```bash
+# stop the producer and every consumer first
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group pipeline --topic pageviews --reset-offsets --to-earliest --execute
+uv run consumer
+uv run counters
+```
+
+```text
+  total      20
+  users tracked  20
+```
+
+Twenty again, not twenty-three: the same replay mechanism that corrupted the
+counter repairs it, because this time nothing crashed partway.
+
+Two conditions, both load-bearing. Stopping the producer gives the replay a
+fixed endpoint, so the result is a number you can check rather than a moving
+target — and if you take the other route, replaying under a *fresh* group
+alongside the original one, it also stops the two groups double-counting
+whatever arrives during the cutover. And replay without failure injection, or
+the rebuild overcounts exactly as the original run did.
+
+The reset also requires the group to be *inactive*. A consumer killed abruptly
+stays a member until its session times out, so the command refuses for around
+forty-five seconds afterwards with `the current state is Stable`.
 
 ## The log outlives the container
 
@@ -221,9 +309,9 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_a2b4cf0d, committed offsets advanced 107 to 326, and nothing was left running
+PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_c31da1e2, committed offsets advanced 106 to 317, 4 page counters and 324 last-page values written, and nothing was left running
 
-all 4 checks passed in 21.7s
+all 4 checks passed in 21.8s
 ```
 
 On a brand new cluster you will also see `NotCoordinatorError` once or twice
@@ -236,10 +324,12 @@ own four partitions, confirms committed offsets advance, and stops it again. The
 other three build their own clients, so they would all pass with a broken
 Procfile.
 
-It runs against a topic and consumer group created for that run alone, handed to
-Honcho through the environment. Sharing `pageviews` and the `pipeline` group
+It runs against a topic, consumer group and Redis key prefix created for that
+run alone, all handed to Honcho through the environment. Sharing `pageviews` and the `pipeline` group
 would let a topology you happen to have running satisfy the check — and a live
 `honcho` process is not evidence that the members being observed are its own.
+It asserts both Redis branches, so the release cannot ship with its idempotent
+half broken, and clears its keys only after the consumers have stopped.
 
 CI runs these as two jobs. `quality` covers linting, formatting, unit tests and
 Compose parsing; `integration` starts the real topology and runs the smoke test.
@@ -250,13 +340,15 @@ published only after both tag workflows pass.
 ## Project structure
 
 ```text
-docker-compose.yml       a single Kafka broker in KRaft mode
+docker-compose.yml       a Kafka broker in KRaft mode, and Redis
 src/pipeline/
     __init__.py          logging setup and connection retry
     config.py            environment-driven settings, host addresses by default
     topics.py            the one path that creates topics
     producer.py          routes events to partitions by username
-    kafka_consumer.py    reads them back, committing offsets explicitly
+    kafka_consumer.py    reads them back, applying each to Redis before committing
+    redis_store.py       the two writes, and the keys they land on
+    counters.py          prints the counters and their total
     smoke_test.py        bounded assertions against a running broker
 tests/
 Procfile                 the processes that make up the running system

@@ -483,6 +483,7 @@ def _topology_scaffold(monkeypatch, stop_result):
     """Patch everything the topology check touches except the part under test."""
     monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
     monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
+    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
     monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
     monkeypatch.setattr(smoke_test, "_stop_topology", lambda process: stop_result)
 
@@ -536,6 +537,7 @@ def test_the_topic_is_deleted_even_when_honcho_cannot_start(monkeypatch):
     deleted = []
     monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
     monkeypatch.setattr(smoke_test, "_delete_topic", deleted.append)
+    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
 
     def no_honcho(*args, **kwargs):
         raise FileNotFoundError
@@ -557,6 +559,7 @@ def test_the_topic_is_deleted_when_it_cannot_be_created(monkeypatch):
 
     monkeypatch.setattr(smoke_test, "ensure_topic", cannot_create)
     monkeypatch.setattr(smoke_test, "_delete_topic", deleted.append)
+    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
 
     passed, detail = smoke_test.honcho_topology_does_the_work()
 
@@ -658,3 +661,107 @@ def test_stop_topology_never_signals_a_captured_group(monkeypatch):
 
     # Only Honcho's own group (100) is ever signalled; 200 and 300 are not.
     assert {pgid for pgid, _ in signalled} == {100}
+
+
+def _observed_scaffold(monkeypatch, redis_state):
+    """Drive _observe_topology past the Kafka assertions to the Redis ones."""
+    monkeypatch.setattr(
+        smoke_test, "_group_members", lambda g: ({"a", "b", "c", "d"}, "")
+    )
+    monkeypatch.setattr(
+        smoke_test, "_group_offsets", lambda g: ({0: 1, 1: 1, 2: 1, 3: 1}, "")
+    )
+    monkeypatch.setattr(smoke_test, "TOPOLOGY_PROGRESS_SECONDS", 0)
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(smoke_test, "_redis_state", lambda prefix: redis_state)
+    # Offsets must appear to advance for the check to reach Redis at all.
+    offsets = iter([({0: 1, 1: 1, 2: 1, 3: 1}, ""), ({0: 9, 1: 9, 2: 9, 3: 9}, "")])
+    monkeypatch.setattr(smoke_test, "_group_offsets", lambda g: next(offsets))
+
+
+def test_observe_reports_missing_counters(monkeypatch):
+    """The INCR half silently not running must fail the check."""
+    _observed_scaffold(monkeypatch, redis_state=({}, {"ada": "/docs"}, ""))
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:"
+    )
+
+    assert passed is False
+    assert "no smoke:abc:pageviews:* counters" in detail
+
+
+def test_observe_reports_missing_last_page_values(monkeypatch):
+    """The idempotent half silently not running must fail too."""
+    _observed_scaffold(monkeypatch, redis_state=({"/docs": 3}, {}, ""))
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:"
+    )
+
+    assert passed is False
+    assert "no smoke:abc:user:last_page:* values" in detail
+
+
+def test_observe_reports_a_redis_read_failure(monkeypatch):
+    _observed_scaffold(
+        monkeypatch, redis_state=(None, {}, "could not connect to Redis: refused")
+    )
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:"
+    )
+
+    assert passed is False
+    assert "could not connect to Redis" in detail
+
+
+def test_observe_passes_when_both_branches_wrote(monkeypatch):
+    _observed_scaffold(monkeypatch, redis_state=({"/docs": 3}, {"ada": "/docs"}, ""))
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:"
+    )
+
+    assert passed is True
+    assert "1 page counters and 1 last-page values written" in detail
+
+
+def test_redis_keys_are_cleared_only_after_the_topology_stops(monkeypatch):
+    """A live consumer would write the keys straight back."""
+    order = []
+    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
+    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: order.append("topic"))
+    monkeypatch.setattr(
+        smoke_test, "_clear_redis_prefix", lambda prefix: order.append("redis")
+    )
+    monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
+    monkeypatch.setattr(
+        smoke_test, "_stop_topology", lambda p: (order.append("stop"), (True, ""))[1]
+    )
+    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
+
+    smoke_test.honcho_topology_does_the_work()
+
+    assert order.index("stop") < order.index("redis")
+
+
+def test_the_topology_gets_its_own_redis_prefix(monkeypatch):
+    """Isolation: keys must not collide with a topology already running."""
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured.update(kwargs.get("env", {}))
+        return FakeHoncho()
+
+    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
+    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
+    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
+    monkeypatch.setattr(smoke_test.subprocess, "Popen", capture)
+    monkeypatch.setattr(smoke_test, "_stop_topology", lambda p: (True, ""))
+    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
+
+    smoke_test.honcho_topology_does_the_work()
+
+    assert captured["REDIS_KEY_PREFIX"].startswith("smoke:")
+    assert captured["REDIS_KEY_PREFIX"].endswith(":")

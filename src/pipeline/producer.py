@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import time
@@ -46,8 +47,14 @@ def connect() -> KafkaProducer:
     )
 
 
-def produce_forever(producer: KafkaProducer, fake: Faker) -> None:
-    while True:
+def produce(producer: KafkaProducer, fake: Faker, count: int | None = None) -> None:
+    """Produce events, either endlessly or an exact number of them.
+
+    The bounded mode exists so the overcount demonstration can state a figure
+    rather than describe an impression.
+    """
+    produced = 0
+    while count is None or produced < count:
         event = create_event(fake, PAGES)
         # Wait for the broker to acknowledge before claiming success. send()
         # returns a future, so logging without get() would report a delivery
@@ -63,14 +70,29 @@ def produce_forever(producer: KafkaProducer, fake: Faker) -> None:
             f"Produced (partition {metadata.partition}, "
             f"offset {metadata.offset}): {event}"
         )
+        produced += 1
         time.sleep(PRODUCER_INTERVAL_SECONDS)
+
+    logger.info(f"Produced {produced} events and stopped")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate synthetic pageviews.")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="stop after this many events (default: run until interrupted)",
+    )
+    return parser.parse_args(argv)
 
 
 def main() -> int:
+    arguments = parse_args()
     wait_for_topic(KAFKA_TOPIC, KAFKA_SERVER)
     producer = connect()
     try:
-        produce_forever(producer, Faker())
+        produce(producer, Faker(), count=arguments.count)
     except KeyboardInterrupt:
         logger.info("Shutting down producer")
     finally:
