@@ -24,3 +24,11 @@ COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "5"))
 # committing what is pending. Unset means run normally.
 _crash_after = os.environ.get("CONSUMER_CRASH_AFTER")
 CONSUMER_CRASH_AFTER = int(_crash_after) if _crash_after else None
+
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+
+# Prefixes every key this process writes. Overridable so a test run can keep its
+# keys apart from a topology someone else is running, the way CONSUMER_GROUP
+# keeps its offsets apart.
+REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX", "")

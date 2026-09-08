@@ -18,7 +18,7 @@ from collections.abc import Callable
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
 
-from pipeline import ensure_topic, get_partition, wait_for_topic
+from pipeline import ensure_topic, get_partition, redis_store, wait_for_topic
 from pipeline.config import KAFKA_PARTITIONS, KAFKA_SERVER
 
 # Every check is bounded, so a broken topology fails rather than hangs.
@@ -425,8 +425,41 @@ def _stop_topology(process: subprocess.Popen) -> tuple[bool, str]:
     return False, f"process groups still running after shutdown: {survivors}"
 
 
+def _clear_redis_prefix(prefix: str) -> None:
+    """Remove a run's Redis keys. Best effort: never fail the check on cleanup."""
+    try:
+        client = redis_store.connect()
+    except (OSError, redis_store.redis.RedisError) as error:
+        logger.warning(f"could not connect to clear {prefix}: {error}")
+        return
+    try:
+        redis_store.clear(client, prefix)
+    except redis_store.redis.RedisError as error:
+        logger.warning(f"could not clear {prefix}: {error}")
+    finally:
+        client.close()
+
+
+def _redis_state(prefix: str) -> tuple[dict[str, int] | None, dict[str, str], str]:
+    """Counters and last-page values under a prefix, or why they are unavailable."""
+    try:
+        client = redis_store.connect()
+    except (OSError, redis_store.redis.RedisError) as error:
+        return None, {}, f"could not connect to Redis: {error}"
+    try:
+        return (
+            redis_store.page_counts(client, prefix),
+            redis_store.last_pages(client, prefix),
+            "",
+        )
+    except redis_store.redis.RedisError as error:
+        return None, {}, f"reading Redis failed: {error}"
+    finally:
+        client.close()
+
+
 def _observe_topology(
-    honcho: subprocess.Popen, group: str, topic: str
+    honcho: subprocess.Popen, group: str, topic: str, prefix: str
 ) -> tuple[bool, str]:
     """Watch a running topology settle and make progress."""
     deadline = time.monotonic() + TOPOLOGY_SETTLE_SECONDS
@@ -475,9 +508,24 @@ def _observe_topology(
             "the producer or the consumers are not doing their job"
         )
 
+    counts, pages, error = _redis_state(prefix)
+    if counts is None:
+        return False, error
+
+    # Both branches of the release, not just the counter: asserting only the
+    # INCR would let the idempotent half ship broken.
+    if not counts:
+        return False, f"no {prefix}pageviews:* counters were written"
+    if not pages:
+        return False, f"no {prefix}user:last_page:* values were written"
+
     return True, (
         f"{len(members)} consumers owned {len(offsets)} partitions of {topic}, "
-        f"committed offsets advanced {before} to {after}"
+        f"committed offsets advanced {before} to {after}, "
+        # Reported as two independent facts: they are read at different
+        # instants while the topology is still running, so their totals are not
+        # expected to agree.
+        f"{len(counts)} page counters and {len(pages)} last-page values written"
     )
 
 
@@ -492,6 +540,7 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     run_id = uuid.uuid4().hex[:8]
     topic = f"smoke_topology_{run_id}"
     group = f"smoke-topology-{run_id}"
+    prefix = f"smoke:{run_id}:"
     honcho: subprocess.Popen | None = None
     shutdown_error = ""
 
@@ -506,6 +555,9 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
             environment = os.environ | {
                 "KAFKA_TOPIC": topic,
                 "CONSUMER_GROUP": group,
+                # Keys of its own, so a topology someone else is running cannot
+                # satisfy this check.
+                "REDIS_KEY_PREFIX": prefix,
                 "PRODUCER_INTERVAL_SECONDS": "0.05",
                 # Commit every message, so offsets move within the budget.
                 "COMMIT_EVERY": "1",
@@ -529,12 +581,15 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                     ".venv/bin/honcho is missing; run `uv sync --all-extras`",
                 )
             else:
-                observed = _observe_topology(honcho, group, topic)
+                observed = _observe_topology(honcho, group, topic, prefix)
     finally:
         if honcho is not None:
             stopped, shutdown_error = _stop_topology(honcho)
             if not stopped and not shutdown_error:
                 shutdown_error = "the topology did not stop"
+        # Only after the consumers have stopped: a live one would write the
+        # keys straight back.
+        _clear_redis_prefix(prefix)
         _delete_topic(topic)
 
     # Shutdown outranks the observation: a check that leaves the topology

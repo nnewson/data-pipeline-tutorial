@@ -12,6 +12,8 @@ from pipeline.config import (
     KAFKA_SERVER,
     KAFKA_TOPIC,
 )
+from pipeline.redis_store import connect as connect_redis
+from pipeline.redis_store import record_pageview
 
 logger = logging.getLogger("consumer")
 
@@ -37,8 +39,13 @@ def connect() -> KafkaConsumer:
     )
 
 
-def handle(message) -> None:
-    """The work. Replacing this log line with a side effect is the whole of 0.4."""
+def handle(message, redis_client) -> None:
+    """The work: apply one event to Redis, then log what happened.
+
+    This runs before the offset is committed, which is what makes a replayed
+    event count twice. Committing first would lose it instead.
+    """
+    record_pageview(redis_client, message.value)
     logger.info(
         f"Consumed (partition {message.partition}, offset {message.offset}): "
         f"{message.value}"
@@ -47,12 +54,13 @@ def handle(message) -> None:
 
 def consume_forever(
     consumer: KafkaConsumer,
+    redis_client,
     commit_every: int = COMMIT_EVERY,
     crash_after: int | None = CONSUMER_CRASH_AFTER,
 ) -> None:
     processed = 0
     for message in consumer:
-        handle(message)
+        handle(message, redis_client)
         processed += 1
 
         # The work happened before the commit, so a crash here replays it.
@@ -76,13 +84,15 @@ def consume_forever(
 
 def main() -> int:
     wait_for_topic(KAFKA_TOPIC, KAFKA_SERVER)
+    redis_client = connect_redis()
     consumer = connect()
     try:
-        consume_forever(consumer)
+        consume_forever(consumer, redis_client)
     except KeyboardInterrupt:
         logger.info("Shutting down consumer")
     finally:
         consumer.close()
+        redis_client.close()
     return 0
 
 

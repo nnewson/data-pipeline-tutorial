@@ -74,5 +74,23 @@ services:
       retries: 12
       start_period: 10s
 
+  redis:
+    # Pinned to a readable version, as with Kafka.
+    image: redis:8.10-alpine
+    ports:
+      - "6379:6379"
+    # Persistence off, deliberately. The image declares no volume, but RDB
+    # snapshotting is on by default (save 3600 1 300 100 60 10000), so Redis
+    # would otherwise write snapshots into its own filesystem and survive a
+    # restart. Counters here are derived state, rebuildable from the Kafka log;
+    # 0.5's store is the durable one. Making that true rather than implied.
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
 volumes:
   kafka-data:
