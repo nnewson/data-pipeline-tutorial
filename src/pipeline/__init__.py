@@ -15,6 +15,11 @@ logging.basicConfig(
 # than silence it.
 logging.getLogger("kafka").setLevel(logging.WARNING)
 
+# The Cassandra driver narrates connection and topology changes at INFO. Its
+# warnings are kept: one of them is Cassandra telling you that COUNT(*) scans
+# every partition, which is worth hearing.
+logging.getLogger("cassandra").setLevel(logging.WARNING)
+
 logger = logging.getLogger("pipeline")
 
 

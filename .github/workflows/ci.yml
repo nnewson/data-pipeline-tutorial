@@ -80,6 +80,11 @@ jobs:
         # The defined topic-management path, exercised as a reader would.
         run: uv run create-topics
 
+      - name: Create schema
+        # Likewise for Cassandra. `up --wait` already waited for it to be
+        # healthy, which on a cold start is 40-90 seconds of the job's budget.
+        run: uv run create-schema
+
       - name: Smoke test
         # Includes starting the real Procfile topology and stopping it again.
         run: uv run smoke-test

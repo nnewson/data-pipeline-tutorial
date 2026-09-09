@@ -18,8 +18,15 @@ from collections.abc import Callable
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
 
-from pipeline import ensure_topic, get_partition, redis_store, wait_for_topic
+from pipeline import (
+    cassandra_store,
+    ensure_topic,
+    get_partition,
+    redis_store,
+    wait_for_topic,
+)
 from pipeline.config import KAFKA_PARTITIONS, KAFKA_SERVER
+from pipeline.schema import SCHEMA_FILE
 
 # Every check is bounded, so a broken topology fails rather than hangs.
 CONSUME_TIMEOUT_MS = 30_000
@@ -458,8 +465,63 @@ def _redis_state(prefix: str) -> tuple[dict[str, int] | None, dict[str, str], st
         client.close()
 
 
+def _create_keyspace(keyspace: str) -> str:
+    """Give the run a keyspace of its own. Returns an error string, or empty.
+
+    The same schema file the reader applies, pointed at a different keyspace —
+    so the check exercises the real `create-schema` path rather than a
+    hand-written table definition that could drift from it.
+    """
+    try:
+        cluster, session = cassandra_store.connect()
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return f"could not connect to Cassandra: {error}"
+    try:
+        cassandra_store.apply_schema(session, keyspace, SCHEMA_FILE.read_text())
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return f"could not create keyspace {keyspace}: {error}"
+    finally:
+        cluster.shutdown()
+    return ""
+
+
+def _drop_keyspace(keyspace: str) -> None:
+    """Remove a run's keyspace. Best effort: never fail the check on cleanup."""
+    try:
+        cluster, session = cassandra_store.connect()
+    except Exception as error:  # noqa: BLE001 - cleanup is best effort
+        logger.warning(f"could not connect to drop {keyspace}: {error}")
+        return
+    try:
+        cassandra_store.drop_keyspace(session, keyspace)
+    except Exception as error:  # noqa: BLE001 - cleanup is best effort
+        logger.warning(f"could not drop {keyspace}: {error}")
+    finally:
+        cluster.shutdown()
+
+
+def _cassandra_rows(keyspace: str) -> tuple[list | None, str]:
+    """Rows stored under the run's keyspace, or why they are unavailable."""
+    try:
+        cluster, session = cassandra_store.connect(keyspace=keyspace)
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, f"could not read keyspace {keyspace}: {error}"
+    try:
+        rows = list(
+            session.execute(
+                f"SELECT user_id, event_time, event_id, page "
+                f"FROM {cassandra_store.TABLE} LIMIT 5"
+            )
+        )
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, f"reading keyspace {keyspace} failed: {error}"
+    finally:
+        cluster.shutdown()
+    return rows, ""
+
+
 def _observe_topology(
-    honcho: subprocess.Popen, group: str, topic: str, prefix: str
+    honcho: subprocess.Popen, group: str, topic: str, prefix: str, keyspace: str
 ) -> tuple[bool, str]:
     """Watch a running topology settle and make progress."""
     deadline = time.monotonic() + TOPOLOGY_SETTLE_SECONDS
@@ -519,13 +581,27 @@ def _observe_topology(
     if not pages:
         return False, f"no {prefix}user:last_page:* values were written"
 
+    rows, error = _cassandra_rows(keyspace)
+    if rows is None:
+        return False, error
+    if not rows:
+        return False, f"no rows were written to keyspace {keyspace}"
+    missing = [
+        column
+        for column in ("user_id", "event_time", "event_id", "page")
+        if getattr(rows[0], column, None) in (None, "")
+    ]
+    if missing:
+        return False, f"rows in {keyspace} are missing {missing}"
+
     return True, (
         f"{len(members)} consumers owned {len(offsets)} partitions of {topic}, "
         f"committed offsets advanced {before} to {after}, "
         # Reported as two independent facts: they are read at different
         # instants while the topology is still running, so their totals are not
         # expected to agree.
-        f"{len(counts)} page counters and {len(pages)} last-page values written"
+        f"{len(counts)} page counters, {len(pages)} last-page values, "
+        f"and rows in {keyspace}"
     )
 
 
@@ -541,16 +617,24 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     topic = f"smoke_topology_{run_id}"
     group = f"smoke-topology-{run_id}"
     prefix = f"smoke:{run_id}:"
+    # Lowercase and underscore only: CQL folds unquoted identifiers.
+    keyspace = f"smoke_{run_id}"
     honcho: subprocess.Popen | None = None
     shutdown_error = ""
 
     # The functional result is recorded rather than returned, so cleanup always
     # runs and its outcome can take precedence over it.
     try:
+        setup_error = ""
         try:
             ensure_topic(topic, KAFKA_PARTITIONS, KAFKA_SERVER)
         except (KafkaError, OSError, RuntimeError) as error:
-            observed = (False, f"create-topics path failed: {error}")
+            setup_error = f"create-topics path failed: {error}"
+        else:
+            setup_error = _create_keyspace(keyspace)
+
+        if setup_error:
+            observed = (False, setup_error)
         else:
             environment = os.environ | {
                 "KAFKA_TOPIC": topic,
@@ -558,6 +642,8 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                 # Keys of its own, so a topology someone else is running cannot
                 # satisfy this check.
                 "REDIS_KEY_PREFIX": prefix,
+                # A keyspace of its own, for the same reason.
+                "CASSANDRA_KEYSPACE": keyspace,
                 "PRODUCER_INTERVAL_SECONDS": "0.05",
                 # Commit every message, so offsets move within the budget.
                 "COMMIT_EVERY": "1",
@@ -581,7 +667,7 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                     ".venv/bin/honcho is missing; run `uv sync --all-extras`",
                 )
             else:
-                observed = _observe_topology(honcho, group, topic, prefix)
+                observed = _observe_topology(honcho, group, topic, prefix, keyspace)
     finally:
         if honcho is not None:
             stopped, shutdown_error = _stop_topology(honcho)
@@ -590,6 +676,7 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
         # Only after the consumers have stopped: a live one would write the
         # keys straight back.
         _clear_redis_prefix(prefix)
+        _drop_keyspace(keyspace)
         _delete_topic(topic)
 
     # Shutdown outranks the observation: a check that leaves the topology

@@ -7,7 +7,7 @@ module-name = "pipeline"
 
 [project]
 name = "data-pipeline-tutorial"
-version = "0.4"
+version = "0.5"
 description = "A step-by-step rebuild of a Kafka, Redis, Cassandra, RabbitMQ, ZooKeeper, Flink and gRPC pipeline"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -16,6 +16,7 @@ dependencies = [
   "kafka-python",    # Kafka client
   "faker",           # Synthetic event data
   "redis",           # Counters and last-page values
+  "cassandra-driver", # Durable, query-shaped event store
 ]
 
 [project.optional-dependencies]
@@ -47,4 +48,6 @@ create-topics = "pipeline.topics:main"
 producer = "pipeline.producer:main"
 consumer = "pipeline.kafka_consumer:main"
 counters = "pipeline.counters:main"
+create-schema = "pipeline.schema:main"
+events = "pipeline.events:main"
 smoke-test = "pipeline.smoke_test:main"
