@@ -92,5 +92,31 @@ services:
       retries: 10
       start_period: 3s
 
+  cassandra:
+    image: cassandra:5.0
+    ports:
+      - "9042:9042"
+    environment:
+      # Single node. The datacenter name has to match the keyspace's
+      # NetworkTopologyStrategy, so it is set rather than left to a default.
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      # A laptop does not need the default heap.
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    volumes:
+      # Cassandra is a durable materialized view: derived from the Kafka log,
+      # but expected to outlive its container, unlike Redis.
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "SELECT release_version FROM system.local"]
+      interval: 10s
+      timeout: 10s
+      # Cassandra takes tens of seconds to accept CQL. A long start_period stops
+      # those first failures counting against the retry budget.
+      retries: 12
+      start_period: 90s
+
 volumes:
   kafka-data:
+  cassandra-data:

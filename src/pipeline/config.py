@@ -32,3 +32,20 @@ REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 # keys apart from a topology someone else is running, the way CONSUMER_GROUP
 # keeps its offsets apart.
 REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX", "")
+
+# Split, stripped, and emptied entries dropped: "host1, host2" should not
+# produce a host named " host2".
+CASSANDRA_HOSTS = [
+    host.strip()
+    for host in os.environ.get("CASSANDRA_HOSTS", "localhost").split(",")
+    if host.strip()
+]
+CASSANDRA_PORT = int(os.environ.get("CASSANDRA_PORT", "9042"))
+
+# Overridable so a test run can have a keyspace of its own, the way
+# CONSUMER_GROUP and REDIS_KEY_PREFIX give it offsets and keys of its own.
+CASSANDRA_KEYSPACE = os.environ.get("CASSANDRA_KEYSPACE", "pipeline")
+
+# Named explicitly so the driver does not have to guess which datacenter is
+# local, and so it matches the keyspace's NetworkTopologyStrategy.
+CASSANDRA_LOCAL_DC = os.environ.get("CASSANDRA_LOCAL_DC", "datacenter1")

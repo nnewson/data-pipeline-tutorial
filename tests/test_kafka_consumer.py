@@ -26,6 +26,18 @@ class FakeRedis:
         self.set_values[key] = value
 
 
+class FakeSession:
+    """Records Cassandra writes so a test can count rows rather than calls."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def execute(self, statement, parameters=None):
+        if parameters:
+            # Keyed by primary key, so a replay replaces rather than appends.
+            self.rows[(parameters[0], parameters[1], parameters[2])] = parameters[3]
+
+
 class FakeConsumer:
     def __init__(self, messages):
         self._messages = messages
@@ -41,7 +53,12 @@ class FakeConsumer:
 def messages(count):
     return [
         FakeMessage(
-            {"page": f"/p{n % 3}", "user_id": f"user{n}", "event_id": f"e{n}"},
+            {
+                "page": f"/p{n % 3}",
+                "user_id": f"user{n}",
+                "event_id": f"e{n}",
+                "timestamp": 1788894338.0 + n,
+            },
             partition=n % 4,
             offset=n,
         )
@@ -54,7 +71,12 @@ def test_consumes_every_message(caplog):
 
     with caplog.at_level(logging.INFO, logger="consumer"):
         kafka_consumer.consume_forever(
-            consumer, FakeRedis(), commit_every=10, crash_after=None
+            consumer,
+            FakeRedis(),
+            FakeSession(),
+            "insert",
+            commit_every=10,
+            crash_after=None,
         )
 
     assert sum("Consumed" in r.message for r in caplog.records) == 3
@@ -64,7 +86,7 @@ def test_commits_once_per_batch():
     consumer = FakeConsumer(messages(10))
 
     kafka_consumer.consume_forever(
-        consumer, FakeRedis(), commit_every=5, crash_after=None
+        consumer, FakeRedis(), FakeSession(), "insert", commit_every=5, crash_after=None
     )
 
     assert consumer.commits == 2
@@ -75,7 +97,7 @@ def test_does_not_commit_a_partial_batch():
     consumer = FakeConsumer(messages(7))
 
     kafka_consumer.consume_forever(
-        consumer, FakeRedis(), commit_every=5, crash_after=None
+        consumer, FakeRedis(), FakeSession(), "insert", commit_every=5, crash_after=None
     )
 
     assert consumer.commits == 1
@@ -94,7 +116,12 @@ def test_crash_injection_exits_without_committing(monkeypatch):
 
     with pytest.raises(SystemExit):
         kafka_consumer.consume_forever(
-            consumer, FakeRedis(), commit_every=5, crash_after=3
+            consumer,
+            FakeRedis(),
+            FakeSession(),
+            "insert",
+            commit_every=5,
+            crash_after=3,
         )
 
     # Crashed at 3 with commit_every=5, so nothing was ever committed.
@@ -112,7 +139,12 @@ def test_crash_after_a_commit_leaves_the_committed_work_alone(monkeypatch):
 
     with pytest.raises(SystemExit):
         kafka_consumer.consume_forever(
-            consumer, FakeRedis(), commit_every=5, crash_after=7
+            consumer,
+            FakeRedis(),
+            FakeSession(),
+            "insert",
+            commit_every=5,
+            crash_after=7,
         )
 
     # One batch of five was committed before the crash at seven; two replay.
@@ -124,7 +156,12 @@ def test_commit_every_controls_the_duplicate_window(commit_every):
     consumer = FakeConsumer(messages(9))
 
     kafka_consumer.consume_forever(
-        consumer, FakeRedis(), commit_every=commit_every, crash_after=None
+        consumer,
+        FakeRedis(),
+        FakeSession(),
+        "insert",
+        commit_every=commit_every,
+        crash_after=None,
     )
 
     assert consumer.commits == 9 // commit_every
@@ -158,7 +195,12 @@ def test_crash_on_a_commit_boundary_reports_a_full_batch_pending(monkeypatch, ca
 
     with caplog.at_level(logging.WARNING, logger="consumer"), pytest.raises(SystemExit):
         kafka_consumer.consume_forever(
-            consumer, FakeRedis(), commit_every=5, crash_after=5
+            consumer,
+            FakeRedis(),
+            FakeSession(),
+            "insert",
+            commit_every=5,
+            crash_after=5,
         )
 
     assert "5 uncommitted" in caplog.text
@@ -181,7 +223,12 @@ def test_uncommitted_count_is_never_zero(
 
     with caplog.at_level(logging.WARNING, logger="consumer"), pytest.raises(SystemExit):
         kafka_consumer.consume_forever(
-            consumer, FakeRedis(), commit_every=commit_every, crash_after=crash_after
+            consumer,
+            FakeRedis(),
+            FakeSession(),
+            "insert",
+            commit_every=commit_every,
+            crash_after=crash_after,
         )
 
     assert f"{expected} uncommitted" in caplog.text

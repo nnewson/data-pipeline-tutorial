@@ -1,11 +1,13 @@
 import json
 import logging
 import os
+from contextlib import ExitStack
 
 from kafka import KafkaConsumer
 
-from pipeline import wait_for_connection, wait_for_topic
+from pipeline import cassandra_store, wait_for_connection, wait_for_topic
 from pipeline.config import (
+    CASSANDRA_KEYSPACE,
     COMMIT_EVERY,
     CONSUMER_CRASH_AFTER,
     CONSUMER_GROUP,
@@ -39,13 +41,19 @@ def connect() -> KafkaConsumer:
     )
 
 
-def handle(message, redis_client) -> None:
-    """The work: apply one event to Redis, then log what happened.
+def handle(message, redis_client, session, insert) -> None:
+    """The work: apply one event to both stores, then log what happened.
 
-    This runs before the offset is committed, which is what makes a replayed
-    event count twice. Committing first would lose it instead.
+    All of this runs before the offset is committed, which is what makes a
+    replayed event reach both stores again. What each store does with the repeat
+    is up to the write, not the delivery: the Redis counter climbs, the
+    Cassandra row is replaced.
+
+    The three writes are individually atomic and not atomic together. A failure
+    between them leaves partial state — see the README.
     """
     record_pageview(redis_client, message.value)
+    cassandra_store.record_pageview(session, insert, message.value)
     logger.info(
         f"Consumed (partition {message.partition}, offset {message.offset}): "
         f"{message.value}"
@@ -55,12 +63,14 @@ def handle(message, redis_client) -> None:
 def consume_forever(
     consumer: KafkaConsumer,
     redis_client,
+    session,
+    insert,
     commit_every: int = COMMIT_EVERY,
     crash_after: int | None = CONSUMER_CRASH_AFTER,
 ) -> None:
     processed = 0
     for message in consumer:
-        handle(message, redis_client)
+        handle(message, redis_client, session, insert)
         processed += 1
 
         # The work happened before the commit, so a crash here replays it.
@@ -84,15 +94,26 @@ def consume_forever(
 
 def main() -> int:
     wait_for_topic(KAFKA_TOPIC, KAFKA_SERVER)
-    redis_client = connect_redis()
-    consumer = connect()
-    try:
-        consume_forever(consumer, redis_client)
-    except KeyboardInterrupt:
-        logger.info("Shutting down consumer")
-    finally:
-        consumer.close()
-        redis_client.close()
+    # One ownership boundary covering setup as well as the run. Opening these
+    # before the try meant a failure while preparing the statement or connecting
+    # to Kafka left the earlier resources open — and the Cassandra driver keeps
+    # background threads, so that is more than a leaked socket.
+    with ExitStack() as resources:
+        redis_client = connect_redis()
+        resources.callback(redis_client.close)
+
+        cluster, session = cassandra_store.connect(keyspace=CASSANDRA_KEYSPACE)
+        resources.callback(cluster.shutdown)
+
+        insert = cassandra_store.prepare_insert(session)
+
+        consumer = connect()
+        resources.callback(consumer.close)
+
+        try:
+            consume_forever(consumer, redis_client, session, insert)
+        except KeyboardInterrupt:
+            logger.info("Shutting down consumer")
     return 0
 
 

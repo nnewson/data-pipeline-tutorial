@@ -4,17 +4,17 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.4 — Redis.** The consumers stop logging events and start
-applying them: a counter per page, a last-page value per user. That turns 0.3's
-at-least-once delivery from a property into a consequence — one of those two
-writes survives a replay intact, and the other does not.
+**This release: 0.5 — Cassandra.** The consumers now write to a durable,
+query-shaped store as well as to Redis. The same replay that inflates a Redis
+counter leaves the Cassandra table correct — which is the point: idempotency is
+a property of the write, not of the delivery.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.4
+git checkout 0.5
 ```
 
 ## Prerequisites
@@ -40,11 +40,17 @@ the broker, so a topic's partition count is a decision rather than an accident:
 
 ```bash
 uv run create-topics
+uv run create-schema
 ```
 
 ```text
 INFO pipeline: Created topic pageviews with 4 partition(s)
+INFO schema: Applied cassandra_schema.cql to keyspace pipeline
 ```
+
+Cassandra takes 40–90 seconds to accept connections on a first start, so
+`docker compose up -d --wait` will sit there for a while before returning. It
+has not hung.
 
 Then start everything — a producer and four consumers:
 
@@ -163,19 +169,150 @@ uv run counters
 before the crash were never committed, so they were delivered again — and
 counted again.
 
-`users tracked` is 20 in this run and, more to the point, **unchanged by the
-replay**: the same three events applied twice left every last-page value exactly
-as it was. That number is not guaranteed to be 20 — the generator draws random
-usernames and occasionally repeats one — so compare it before and after the
-replay rather than expecting a particular figure. The counter total is the
-deterministic half.
+Now ask Cassandra the same question:
 
-A fix exists and this release does not build it: retries become harmless when a
-write is keyed by stable event identity. Resist reaching for `SET NX` on the
-event id followed by `INCR` — those two commands are each atomic but not atomic
-*together*, which is the trap this release is about. A Redis-native answer needs
-`SADD`/`SCARD`, or a Lua script doing dedupe-and-increment in one step. 0.5
-supplies a concrete idempotent write instead.
+```bash
+uv run events --count
+```
+
+```text
+  rows  20
+```
+
+**Twenty-three in Redis, twenty in Cassandra**, from one replay through one
+handler. Nothing about the delivery differed. What differed is what each write
+does with a repeat:
+
+```python
+client.incr(page_count_key(event["page"]))  # accumulates
+session.execute(insert, (user_id, event_time, event_id, page))  # replaces
+```
+
+The Cassandra insert is an **upsert**, not a deduplicate. Its primary key —
+`((user_id), event_time, event_id)` — addresses a row, and writing it again
+replaces what was there. Nothing detected the duplicate; there was simply
+nowhere else for it to go.
+
+You can watch that happen. Replay everything a second time and look at one
+user's row before and after:
+
+```bash
+uv run events --user <some-user>
+```
+
+```text
+before:  2026-09-08 19:04:51.716000 /docs  aac778f3-…  written_at=1788894338135020
+after:   2026-09-08 19:04:51.716000 /docs  aac778f3-…  written_at=1788894433249511
+```
+
+Same key, same values, **different write time**. The row is query-identical, not
+byte-identical: Cassandra performed the write, and both versions can sit in
+SSTables until compaction removes the older one. Meanwhile that same full replay
+took the Redis total from 23 to 43.
+
+`users tracked` is 20 in this run and, more to the point, unchanged by the
+replay — but the number itself is not guaranteed, because the generator draws
+random usernames and occasionally repeats one. Compare it before and after
+rather than expecting a figure. The counter total and the row count are the
+deterministic halves.
+
+`--count` deserves a warning it gives itself:
+
+```text
+WARNING cassandra.protocol: Server warning: Aggregation query used without partition key
+```
+
+That is Cassandra pointing out that `COUNT(*)` scans every partition, which is
+exactly what this table's design exists to avoid. It earns its place here
+because the dataset is twenty rows and the alternative is asking you to take the
+result on trust. It is a diagnostic, not an access pattern.
+
+## Why the table looks like that
+
+The table answers one question — *what did this user do, most recent first?* —
+and its shape follows from that rather than from the shape of an event:
+
+```sql
+CREATE TABLE pageviews (
+    user_id text,
+    event_time timestamp,
+    event_id text,
+    page text,
+    PRIMARY KEY ((user_id), event_time, event_id)
+) WITH CLUSTERING ORDER BY (event_time DESC, event_id ASC);
+```
+
+- **`user_id` is the partition key**: one user's history lives on one node and
+  is read in one go. It is the same key 0.3 routes Kafka partitions by, so the
+  property that keeps a user's events ordered in the log keeps them together in
+  storage.
+- **`event_time` clusters, descending**, because "most recent first" is the
+  query.
+- **`event_id` clusters after it** as a tie-breaker. Cassandra timestamps are
+  millisecond-precision, so two events for one user can share `event_time`;
+  without `event_id` in the key the second would silently overwrite the first,
+  losing an event. Ordering *within* a millisecond is therefore event-id
+  ordering, not chronology.
+
+The cost is real: you cannot ask "who viewed /pricing?" of this table. The
+conventional answer is a second table keyed by page, written at the same time —
+a predictable access path, at the cost of writing each event twice. Cassandra 5
+also offers Storage-Attached Indexes, which is a different design decision with
+its own trade-offs.
+
+One trap worth naming, because it fails silently rather than loudly. The
+producer emits Unix seconds as a float, and the driver reads a bare number as
+*milliseconds*:
+
+```text
+producer emits:                 1788893388.843115
+bound as a float             -> 1970-01-21 16:54:53.388000
+bound as a tz-aware datetime -> 2026-09-08 18:49:48.843000
+```
+
+So the insert binds `datetime.fromtimestamp(event["timestamp"], tz=UTC)`. Bind
+the float and every row lands in January 1970 without an error anywhere.
+
+## When a store goes away
+
+Stop Cassandra while the consumer is idle and nothing happens: the driver
+reconnects with backoff and the consumer carries on when it returns.
+
+Stop it while a write is **in flight** and the story is different:
+
+```text
+cassandra.cluster.NoHostAvailable: ('Unable to complete the operation against any hosts',
+  {<Host: 127.0.0.1:9042 datacenter1>: ConnectionShutdown('Connection to 127.0.0.1:9042 is closed')})
+```
+
+The consumer dies there, and where it dies matters. Redis had already been
+updated for that event; the Kafka offset had not been committed. Measured: 58
+events logged as consumed, **59 in the Redis counter** — the 59th event's
+increment landed, and then the write that would have followed it did not.
+
+Restart Cassandra and the consumer, let it drain, and the gap is still there:
+
+```text
+  total  398      # Redis
+  rows   394      # Cassandra
+```
+
+So the lesson is narrower than "a dependency outage causes duplicates", and
+narrower than its opposite:
+
+> **Divergence needs the handler to terminate before committing.** A dependency
+> that goes away while nothing is being written does not cause that. A write
+> that fails does.
+
+The injected crash from 0.3 is a controlled version of exactly this. The
+difference is that a real fault picks its own moment, and that moment is
+sometimes between two of the three writes.
+
+A stopped container closes its socket, so the failure arrives as
+`NoHostAvailable` almost immediately. A node that is merely unreachable would
+instead exhaust the driver's request timeout — ten seconds by default — and
+raise `OperationTimedOut`. Same consequence, different exception and different
+delay.
 
 ## Derived state, and rebuilding it
 
@@ -187,9 +324,19 @@ command: redis-server --save "" --appendonly no
 
 That is deliberate, and worth being mechanical about. The image declares no
 volume, but RDB snapshotting is *on* by default, so without that command Redis
-would write snapshots into its own filesystem and survive a restart. Counters
-here are derived state — the Kafka log is the record, and Redis is a view of it.
-Kafka gets a named volume; Redis does not.
+would write snapshots into its own filesystem and survive a restart.
+
+Three services, three answers to "what survives being replaced":
+
+| | role | named volume |
+|---|---|---|
+| Kafka | the durable, replayable source log | yes |
+| Redis | a deliberately volatile materialized view | no |
+| Cassandra | a durable, query-oriented materialized view | yes |
+
+Cassandra is still *derived* from the Kafka log — everything in it can be
+rebuilt by the same replay that rebuilds Redis. Its volume changes how durable
+and how queryable the view is, not where the truth lives.
 
 Rebuilding is not automatic, though. Restart Redis and the counters are gone;
 restart the pipeline and they stay gone, because the consumer group resumes from
@@ -309,7 +456,7 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_c31da1e2, committed offsets advanced 106 to 317, 4 page counters and 324 last-page values written, and nothing was left running
+PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_c31da1e2, committed offsets advanced 106 to 317, 4 page counters, 338 last-page values, and rows in smoke_ba0870d4, and nothing was left running
 
 all 4 checks passed in 21.8s
 ```
@@ -324,12 +471,14 @@ own four partitions, confirms committed offsets advance, and stops it again. The
 other three build their own clients, so they would all pass with a broken
 Procfile.
 
-It runs against a topic, consumer group and Redis key prefix created for that
-run alone, all handed to Honcho through the environment. Sharing `pageviews` and the `pipeline` group
+It runs against a topic, consumer group, Redis key prefix and Cassandra keyspace
+created for that run alone, all handed to Honcho through the environment. Sharing `pageviews` and the `pipeline` group
 would let a topology you happen to have running satisfy the check — and a live
 `honcho` process is not evidence that the members being observed are its own.
-It asserts both Redis branches, so the release cannot ship with its idempotent
-half broken, and clears its keys only after the consumers have stopped.
+It asserts both Redis branches and that rows reached Cassandra with their key
+columns populated, so the release cannot ship with any of its writes silently
+not happening. Keys and keyspace are cleared only after the consumers have
+stopped, or a live one would write them straight back.
 
 CI runs these as two jobs. `quality` covers linting, formatting, unit tests and
 Compose parsing; `integration` starts the real topology and runs the smoke test.
@@ -340,15 +489,19 @@ published only after both tag workflows pass.
 ## Project structure
 
 ```text
-docker-compose.yml       a Kafka broker in KRaft mode, and Redis
+docker-compose.yml       Kafka in KRaft mode, Redis, and Cassandra
+cassandra_schema.cql     the keyspace and table, applied by create-schema
 src/pipeline/
     __init__.py          logging setup and connection retry
     config.py            environment-driven settings, host addresses by default
     topics.py            the one path that creates topics
     producer.py          routes events to partitions by username
-    kafka_consumer.py    reads them back, applying each to Redis before committing
-    redis_store.py       the two writes, and the keys they land on
-    counters.py          prints the counters and their total
+    kafka_consumer.py    reads them back, applying each to both stores
+    redis_store.py       the two Redis writes, and the keys they land on
+    cassandra_store.py   the durable write, and the identity that keys it
+    schema.py            the one path that creates keyspaces and tables
+    counters.py          prints the Redis counters and their total
+    events.py            reads back what Cassandra stored
     smoke_test.py        bounded assertions against a running broker
 tests/
 Procfile                 the processes that make up the running system
