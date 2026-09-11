@@ -117,6 +117,37 @@ services:
       retries: 12
       start_period: 90s
 
+  rabbitmq:
+    # The management image, so the queue is visible in a browser as well as
+    # through the CLI.
+    image: rabbitmq:4.1-management
+    # RabbitMQ's data directory is named after its node, which defaults to the
+    # container hostname — and Docker defaults that to the container id. Without
+    # a fixed hostname a recreated container starts under a different path
+    # inside the same volume, and the "durable" queue appears empty.
+    hostname: rabbitmq
+    environment:
+      # Local demonstration credentials, also the management UI login. The
+      # built-in guest account only works over the broker's own loopback
+      # interface, so a container client would be refused.
+      RABBITMQ_DEFAULT_USER: pipeline
+      RABBITMQ_DEFAULT_PASS: pipeline
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      # Durability needs all three: a durable queue, persistent messages, and
+      # somewhere for the broker to keep them. Ready and unacknowledged messages
+      # survive a restart; acknowledged ones are gone and cannot be replayed.
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
 volumes:
   kafka-data:
   cassandra-data:
+  rabbitmq-data:

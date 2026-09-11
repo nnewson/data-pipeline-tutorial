@@ -486,6 +486,7 @@ def _topology_scaffold(monkeypatch, stop_result):
     monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
     monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
     monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
     monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
     monkeypatch.setattr(smoke_test, "_stop_topology", lambda process: stop_result)
 
@@ -542,6 +543,7 @@ def test_the_topic_is_deleted_even_when_honcho_cannot_start(monkeypatch):
     monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
     monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
     monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
 
     def no_honcho(*args, **kwargs):
         raise FileNotFoundError
@@ -566,6 +568,7 @@ def test_the_topic_is_deleted_when_it_cannot_be_created(monkeypatch):
     monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
     monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
     monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
 
     passed, detail = smoke_test.honcho_topology_does_the_work()
 
@@ -680,6 +683,8 @@ def _observed_scaffold(monkeypatch, redis_state):
     monkeypatch.setattr(smoke_test, "TOPOLOGY_PROGRESS_SECONDS", 0)
     monkeypatch.setattr(smoke_test.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(smoke_test, "_redis_state", lambda prefix: redis_state)
+    monkeypatch.setattr(smoke_test, "_queue_consumers", lambda queue: (4, ""))
+    monkeypatch.setattr(smoke_test, "_job_state", lambda prefix: (7, {"e1": 1}, ""))
 
     class Row:
         user_id = "ada"
@@ -698,7 +703,7 @@ def test_observe_reports_missing_counters(monkeypatch):
     _observed_scaffold(monkeypatch, redis_state=({}, {"ada": "/docs"}, ""))
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is False
@@ -710,7 +715,7 @@ def test_observe_reports_missing_last_page_values(monkeypatch):
     _observed_scaffold(monkeypatch, redis_state=({"/docs": 3}, {}, ""))
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is False
@@ -723,7 +728,7 @@ def test_observe_reports_a_redis_read_failure(monkeypatch):
     )
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is False
@@ -734,7 +739,7 @@ def test_observe_passes_when_both_branches_wrote(monkeypatch):
     _observed_scaffold(monkeypatch, redis_state=({"/docs": 3}, {"ada": "/docs"}, ""))
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is True
@@ -749,6 +754,7 @@ def test_redis_keys_are_cleared_only_after_the_topology_stops(monkeypatch):
     monkeypatch.setattr(
         smoke_test, "_clear_redis_prefix", lambda prefix: order.append("redis")
     )
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
     monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
     monkeypatch.setattr(
         smoke_test, "_drop_keyspace", lambda keyspace: order.append("cassandra")
@@ -777,6 +783,7 @@ def test_the_topology_gets_its_own_redis_prefix(monkeypatch):
     monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
     monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
     monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
     monkeypatch.setattr(smoke_test.subprocess, "Popen", capture)
     monkeypatch.setattr(smoke_test, "_stop_topology", lambda p: (True, ""))
     monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
@@ -807,6 +814,8 @@ def _cassandra_scaffold(monkeypatch, rows_result):
         smoke_test, "_redis_state", lambda prefix: ({"/docs": 3}, {"ada": "/docs"}, "")
     )
     monkeypatch.setattr(smoke_test, "_cassandra_rows", lambda keyspace: rows_result)
+    monkeypatch.setattr(smoke_test, "_queue_consumers", lambda queue: (4, ""))
+    monkeypatch.setattr(smoke_test, "_job_state", lambda prefix: (7, {"e1": 1}, ""))
 
 
 def test_observe_reports_a_cassandra_read_failure(monkeypatch):
@@ -815,7 +824,7 @@ def test_observe_reports_a_cassandra_read_failure(monkeypatch):
     )
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is False
@@ -827,7 +836,7 @@ def test_observe_reports_no_rows_written(monkeypatch):
     _cassandra_scaffold(monkeypatch, rows_result=([], ""))
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is False
@@ -845,7 +854,7 @@ def test_observe_reports_a_missing_key_column(monkeypatch, column):
     _cassandra_scaffold(monkeypatch, rows_result=([Incomplete()], ""))
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is False
@@ -856,7 +865,7 @@ def test_observe_passes_when_rows_are_complete(monkeypatch):
     _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
 
     passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc"
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
     )
 
     assert passed is True
@@ -874,6 +883,7 @@ def test_the_topology_gets_its_own_keyspace(monkeypatch):
     monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
     monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
     monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
     monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
     monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
     monkeypatch.setattr(smoke_test.subprocess, "Popen", capture)
@@ -898,6 +908,7 @@ def test_a_failed_keyspace_creation_fails_the_check(monkeypatch):
         lambda keyspace: "could not connect to Cassandra",
     )
     monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
     monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
     monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
 
@@ -917,6 +928,7 @@ def test_the_keyspace_is_dropped_after_the_topology_stops(monkeypatch):
     monkeypatch.setattr(
         smoke_test, "_drop_keyspace", lambda keyspace: order.append("drop")
     )
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
     monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
     monkeypatch.setattr(
         smoke_test, "_stop_topology", lambda p: (order.append("stop"), (True, ""))[1]
@@ -926,3 +938,102 @@ def test_the_keyspace_is_dropped_after_the_topology_stops(monkeypatch):
     smoke_test.honcho_topology_does_the_work()
 
     assert order.index("stop") < order.index("drop")
+
+
+def test_observe_reports_the_wrong_number_of_workers(monkeypatch):
+    """Four workers must be consuming the run's own queue."""
+    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
+    monkeypatch.setattr(smoke_test, "_queue_consumers", lambda queue: (2, ""))
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
+    )
+
+    assert passed is False
+    assert "2 workers were consuming smoke_q" in detail
+
+
+def test_observe_reports_a_rabbitmq_failure(monkeypatch):
+    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
+    monkeypatch.setattr(
+        smoke_test,
+        "_queue_consumers",
+        lambda queue: (None, "could not connect to RabbitMQ"),
+    )
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
+    )
+
+    assert passed is False
+    assert "could not connect to RabbitMQ" in detail
+
+
+def test_observe_reports_no_completed_jobs(monkeypatch):
+    """Publishing without any worker completing would otherwise pass."""
+    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
+    monkeypatch.setattr(smoke_test, "_job_state", lambda prefix: (0, {}, ""))
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
+    )
+
+    assert passed is False
+    assert "no jobs completed" in detail
+
+
+def test_observe_reports_a_job_state_failure(monkeypatch):
+    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
+    monkeypatch.setattr(
+        smoke_test, "_job_state", lambda prefix: (None, {}, "reading job state failed")
+    )
+
+    passed, detail = smoke_test._observe_topology(
+        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
+    )
+
+    assert passed is False
+    assert "reading job state failed" in detail
+
+
+def test_the_topology_gets_its_own_queue(monkeypatch):
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured.update(kwargs.get("env", {}))
+        return FakeHoncho()
+
+    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
+    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
+    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
+    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
+    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
+    monkeypatch.setattr(smoke_test.subprocess, "Popen", capture)
+    monkeypatch.setattr(smoke_test, "_stop_topology", lambda p: (True, ""))
+    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
+
+    smoke_test.honcho_topology_does_the_work()
+
+    assert captured["RABBITMQ_QUEUE"].startswith("smoke_jobs_")
+
+
+def test_the_queue_is_deleted_after_the_topology_stops(monkeypatch):
+    order = []
+    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
+    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
+    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
+    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
+    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
+    monkeypatch.setattr(
+        smoke_test, "_delete_queue", lambda queue: order.append("queue")
+    )
+    monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
+    monkeypatch.setattr(
+        smoke_test, "_stop_topology", lambda p: (order.append("stop"), (True, ""))[1]
+    )
+    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
+
+    smoke_test.honcho_topology_does_the_work()
+
+    assert order.index("stop") < order.index("queue")

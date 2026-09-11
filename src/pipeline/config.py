@@ -49,3 +49,24 @@ CASSANDRA_KEYSPACE = os.environ.get("CASSANDRA_KEYSPACE", "pipeline")
 # Named explicitly so the driver does not have to guess which datacenter is
 # local, and so it matches the keyspace's NetworkTopologyStrategy.
 CASSANDRA_LOCAL_DC = os.environ.get("CASSANDRA_LOCAL_DC", "datacenter1")
+
+RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "localhost")
+RABBITMQ_PORT = int(os.environ.get("RABBITMQ_PORT", "5672"))
+
+# Local demonstration credentials. RabbitMQ's built-in guest account may only
+# connect over the broker's own loopback interface, so a container client using
+# it would be refused — a real user is needed even for a tutorial.
+RABBITMQ_USER = os.environ.get("RABBITMQ_USER", "pipeline")
+RABBITMQ_PASSWORD = os.environ.get("RABBITMQ_PASSWORD", "pipeline")
+
+# One shared queue with competing workers, not one queue per Kafka partition.
+# Overridable so a test run can have a queue of its own.
+RABBITMQ_QUEUE = os.environ.get("RABBITMQ_QUEUE", "analytics_jobs")
+
+# The workers exist to be slow: a queue earns its place by keeping slow work off
+# the fast path, and a delay is what makes queue depth and prefetch observable.
+WORKER_DELAY_SECONDS = float(os.environ.get("WORKER_DELAY_SECONDS", "0.5"))
+
+# How many unacknowledged messages one worker may hold. 1 spreads work evenly;
+# higher values let a worker reserve a backlog and can reduce fairness.
+WORKER_PREFETCH = int(os.environ.get("WORKER_PREFETCH", "1"))
