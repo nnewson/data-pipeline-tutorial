@@ -16,3 +16,11 @@ consumer_1: .venv/bin/consumer
 consumer_2: .venv/bin/consumer
 consumer_3: .venv/bin/consumer
 consumer_4: .venv/bin/consumer
+# Four workers competing for ONE queue, unlike the consumers above which each
+# own a Kafka partition. A fifth worker adds capacity, and can raise throughput
+# while there is a backlog to work through; a fifth consumer would simply sit
+# idle, because a partition has at most one consumer in a group.
+worker_1: .venv/bin/worker
+worker_2: .venv/bin/worker
+worker_3: .venv/bin/worker
+worker_4: .venv/bin/worker

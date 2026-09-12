@@ -22,6 +22,7 @@ from pipeline import (
     cassandra_store,
     ensure_topic,
     get_partition,
+    jobs_queue,
     redis_store,
     wait_for_topic,
 )
@@ -520,8 +521,62 @@ def _cassandra_rows(keyspace: str) -> tuple[list | None, str]:
     return rows, ""
 
 
+def _delete_queue(queue: str) -> None:
+    """Remove a run's queue. Best effort: never fail the check on cleanup."""
+    try:
+        connection = jobs_queue.connect()
+    except Exception as error:  # noqa: BLE001 - cleanup is best effort
+        logger.warning(f"could not connect to delete {queue}: {error}")
+        return
+    try:
+        connection.channel().queue_delete(queue=queue)
+    except Exception as error:  # noqa: BLE001 - cleanup is best effort
+        logger.warning(f"could not delete {queue}: {error}")
+    finally:
+        jobs_queue.close_quietly(connection)
+
+
+def _queue_consumers(queue: str) -> tuple[int | None, str]:
+    """How many workers are consuming the queue.
+
+    Shares `jobs_queue.queue_state`, so the inspection cannot drift from the one
+    `uv run jobs` uses — including its passive declare, which asks about the
+    queue rather than creating it. Declaring here would hide a broken
+    declaration path in the publisher or the workers.
+    """
+    try:
+        _waiting, consumers = jobs_queue.queue_state(queue)
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, f"could not inspect queue {queue}: {error}"
+    return consumers, ""
+
+
+def _job_state(prefix: str) -> tuple[int | None, dict[str, int], str]:
+    """Completed executions recorded by the workers.
+
+    Queue depth cannot answer this: acknowledged messages are gone, so the
+    workers record completions in Redis instead.
+    """
+    try:
+        client = redis_store.connect()
+    except (OSError, redis_store.redis.RedisError) as error:
+        return None, {}, f"could not connect to Redis: {error}"
+    try:
+        completed, runs = redis_store.job_summary(client, prefix)
+    except redis_store.redis.RedisError as error:
+        return None, {}, f"reading job state failed: {error}"
+    finally:
+        client.close()
+    return completed, runs, ""
+
+
 def _observe_topology(
-    honcho: subprocess.Popen, group: str, topic: str, prefix: str, keyspace: str
+    honcho: subprocess.Popen,
+    group: str,
+    topic: str,
+    prefix: str,
+    keyspace: str,
+    queue: str,
 ) -> tuple[bool, str]:
     """Watch a running topology settle and make progress."""
     deadline = time.monotonic() + TOPOLOGY_SETTLE_SECONDS
@@ -581,6 +636,20 @@ def _observe_topology(
     if not pages:
         return False, f"no {prefix}user:last_page:* values were written"
 
+    consumers, error = _queue_consumers(queue)
+    if consumers is None:
+        return False, error
+    if consumers != KAFKA_PARTITIONS:
+        return False, (
+            f"{consumers} workers were consuming {queue}, expected {KAFKA_PARTITIONS}"
+        )
+
+    completed, runs, error = _job_state(prefix)
+    if completed is None:
+        return False, error
+    if completed < 1:
+        return False, f"no jobs completed under {prefix}"
+
     rows, error = _cassandra_rows(keyspace)
     if rows is None:
         return False, error
@@ -601,7 +670,8 @@ def _observe_topology(
         # instants while the topology is still running, so their totals are not
         # expected to agree.
         f"{len(counts)} page counters, {len(pages)} last-page values, "
-        f"and rows in {keyspace}"
+        f"rows in {keyspace}, and {completed} job(s) across {len(runs)} "
+        f"event(s) completed by {consumers} workers"
     )
 
 
@@ -619,6 +689,7 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     prefix = f"smoke:{run_id}:"
     # Lowercase and underscore only: CQL folds unquoted identifiers.
     keyspace = f"smoke_{run_id}"
+    queue = f"smoke_jobs_{run_id}"
     honcho: subprocess.Popen | None = None
     shutdown_error = ""
 
@@ -644,6 +715,10 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                 "REDIS_KEY_PREFIX": prefix,
                 # A keyspace of its own, for the same reason.
                 "CASSANDRA_KEYSPACE": keyspace,
+                # A queue of its own, for the same reason.
+                "RABBITMQ_QUEUE": queue,
+                # Fast enough that the check is not waiting on simulated work.
+                "WORKER_DELAY_SECONDS": "0.02",
                 "PRODUCER_INTERVAL_SECONDS": "0.05",
                 # Commit every message, so offsets move within the budget.
                 "COMMIT_EVERY": "1",
@@ -667,7 +742,9 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                     ".venv/bin/honcho is missing; run `uv sync --all-extras`",
                 )
             else:
-                observed = _observe_topology(honcho, group, topic, prefix, keyspace)
+                observed = _observe_topology(
+                    honcho, group, topic, prefix, keyspace, queue
+                )
     finally:
         if honcho is not None:
             stopped, shutdown_error = _stop_topology(honcho)
@@ -677,6 +754,7 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
         # keys straight back.
         _clear_redis_prefix(prefix)
         _drop_keyspace(keyspace)
+        _delete_queue(queue)
         _delete_topic(topic)
 
     # Shutdown outranks the observation: a check that leaves the topology

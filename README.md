@@ -4,17 +4,17 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.5 — Cassandra.** The consumers now write to a durable,
-query-shaped store as well as to Redis. The same replay that inflates a Redis
-counter leaves the Cassandra table correct — which is the point: idempotency is
-a property of the write, not of the delivery.
+**This release: 0.6 — RabbitMQ.** The consumers now publish a job per event, and
+four workers compete for one queue. A replay stops being about stored values and
+starts being about work that runs twice — and there are now two different ways a
+job can repeat, which look nothing alike.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.5
+git checkout 0.6
 ```
 
 ## Prerequisites
@@ -52,7 +52,7 @@ Cassandra takes 40–90 seconds to accept connections on a first start, so
 `docker compose up -d --wait` will sit there for a while before returning. It
 has not hung.
 
-Then start everything — a producer and four consumers:
+Then start everything — a producer, four consumers, and four workers:
 
 ```bash
 uv run honcho start
@@ -133,6 +133,7 @@ Start clean, and produce an exact number of events:
 ```bash
 docker compose down --volumes && docker compose up -d --wait
 uv run create-topics
+uv run create-schema        # --volumes wiped the keyspace too
 uv run producer --count 20
 ```
 
@@ -144,6 +145,13 @@ COMMIT_EVERY=5 CONSUMER_CRASH_AFTER=3 uv run consumer
 
 ```text
 WARNING consumer: Injected crash after 3 messages with 3 uncommitted
+```
+
+The jobs those events publish need someone to run them, so start the workers in
+a second terminal and leave them there:
+
+```bash
+uv run honcho start worker_1 worker_2 worker_3 worker_4
 ```
 
 Now run a consumer again and wait for `Committed offsets after 20 messages`
@@ -314,6 +322,157 @@ instead exhaust the driver's request timeout — ten seconds by default — and
 raise `OperationTimedOut`. Same consequence, different exception and different
 delay.
 
+## One queue, four workers
+
+The consumers publish a job per event; four workers compete for a single queue.
+That is deliberately *not* what 0.3 does, and the contrast is the point.
+
+```
+Kafka:     4 partitions -> 4 consumers, one each.  A fifth consumer sits idle.
+RabbitMQ:  1 queue      -> 4 workers competing.    A fifth worker adds capacity.
+```
+
+Kafka partitions preserve per-key processing order but cap a consumer group's
+parallelism. This queue trades that order for a worker pool that scales with the
+backlog. Two jobs for the same user can be handled at the same time, in either
+order — the queue itself is FIFO, but concurrent workers and redelivery decide
+what actually finishes when.
+
+The workers are deliberately slow (`WORKER_DELAY_SECONDS`, default 0.5s),
+because that is the reason a queue exists: keeping slow work off the fast path.
+Run the topology with a fast producer and watch the backlog build:
+
+```bash
+uv run jobs
+```
+
+```text
+  waiting     579
+  workers     4
+  completed   172
+  distinct    172
+```
+
+**On fairness, a measured caveat.** With `prefetch=1` four workers took
+43/43/43/43 jobs. With `prefetch=50` they took 37/37/37/37 — also even. High
+prefetch *can* reduce fairness, but not here: four identical, permanently busy
+workers get round-robin deliveries either way. Prefetch bites when workers
+differ in speed, with a slow one sitting on reserved messages while a fast one
+idles. This topology does not demonstrate that, and pretending otherwise would
+be inventing a result.
+
+## Two ways a job repeats
+
+There are now two independent at-least-once boundaries, and they are not the
+same thing:
+
+| Failure | What RabbitMQ sees | `redelivered` |
+|---|---|---|
+| A worker dies before acknowledging | the same delivery, requeued | `True` |
+| A Kafka consumer crashes after publishing | two publishes, same `event_id` | `False` on both |
+
+RabbitMQ can tell you *it* redelivered something. It cannot tell you that an
+upstream Kafka replay published the same event twice — at this layer those are
+two unrelated messages. Only `event_id`, carried in the job body and the AMQP
+`message_id`, reveals them as the same work.
+
+**Kill a worker mid-job** and another picks it up. With the topology running
+and a backlog building, find a worker and stop it:
+
+```bash
+pgrep -f '\.venv/bin/worker' | head -1 | xargs kill -9
+```
+
+Measured at 0.5s from `SIGKILL` to another worker logging:
+
+```text
+INFO worker: Working job ecaec99b-… (redelivered=True) for esilva /docs
+```
+
+Compare that with 0.3, where a dead consumer's partitions sit idle until the
+group rebalances — tens of seconds, not fractions of one.
+
+**Replay a Kafka crash** and `uv run jobs` shows the other shape. Twenty events,
+one consumer crashed with three uncommitted, then restarted:
+
+```text
+  waiting     0
+  workers     4
+  completed   23
+  distinct    20
+
+  3 event(s) ran more than once:
+    4e13c201-…  x2
+    5136445a-…  x2
+    fe525fda-…  x2
+```
+
+Twenty-three executions of twenty events — and **not one `redelivered=True` in
+any worker log**. RabbitMQ saw twenty-three perfectly ordinary first deliveries,
+because from its side that is exactly what they were. Only `event_id` shows
+three of them as repeats.
+
+Run those two from *separate clean stacks*. Sharing state makes an excess count
+ambiguous, and telling the two apart is the whole lesson.
+
+## Four writes, four behaviours
+
+The handler now performs four writes before committing its offset:
+
+| write | after a replay |
+|---|---|
+| `INCR` (Redis) | accumulates — the count is wrong |
+| `SET` (Redis) | converges — the value is right |
+| `INSERT` (Cassandra) | replaces — the row is right |
+| **publish (RabbitMQ)** | **re-runs — the work happens twice** |
+
+The first three are about stored state. The fourth is not: a duplicate job is a
+side effect that *executes* again. If it sent an email or charged a card, "the
+value converges" would be no comfort. Idempotency has to be designed into the
+consumer of the job, not only the writer of a row.
+
+## What a publisher confirm actually proves
+
+```python
+channel.confirm_delivery()
+channel.basic_publish(..., mandatory=True)
+```
+
+Both are needed, and neither is sufficient alone. RabbitMQ will **confirm a
+message it could not route**, so confirms by themselves do not show the job
+reached a queue — `mandatory=True` is what turns an unroutable publish into a
+visible failure.
+
+And the guarantee has a limit worth stating plainly: the consumer cannot claim
+the publish succeeded until it is confirmed, and if the connection fails before
+the confirmation arrives, **the outcome is unknown**. Retrying then risks another
+duplicate — the same problem this release is about, one layer down.
+
+A failed publish raises, so the Kafka offset is not committed and the event is
+redelivered.
+
+## Counting work that has finished
+
+Queue depth cannot tell you how much work completed: acknowledged messages are
+gone. So the workers record completions in Redis, under the same per-run prefix
+0.4 introduced:
+
+```text
+<prefix>jobs:runs    event_id -> how many times it ran
+```
+
+**One key, not two.** An earlier version also stored a running total. A worker
+dying between the two increments left the total permanently ahead of the
+per-event counts — 0.4's two-command trap, recreated in the instrumentation
+meant to demonstrate it. The total is summed from this hash instead, in a single
+read.
+
+That is how `uv run jobs` names the events that ran more than once. Note what
+this counter is: a non-idempotent side effect recording a non-idempotent side
+effect. A worker dying between the Redis update and its acknowledgement will run
+the work again *and* count it again. That is evidence for the lesson rather than
+noise — but it does mean the number is not ground truth.
+
 ## Derived state, and rebuilding it
 
 Redis runs with persistence off:
@@ -333,10 +492,30 @@ Three services, three answers to "what survives being replaced":
 | Kafka | the durable, replayable source log | yes |
 | Redis | a deliberately volatile materialized view | no |
 | Cassandra | a durable, query-oriented materialized view | yes |
+| RabbitMQ | durable work awaiting completion | yes, but only while unacknowledged |
 
 Cassandra is still *derived* from the Kafka log — everything in it can be
 rebuilt by the same replay that rebuilds Redis. Its volume changes how durable
 and how queryable the view is, not where the truth lives.
+
+RabbitMQ needs all three parts to be durable: a durable queue, persistent
+messages, and a broker volume — **plus a fixed hostname**. Its data directory is
+named after its node, which defaults to the container hostname, which Docker
+defaults to the container id. Recreate the container without `hostname:
+rabbitmq` and the broker starts under a different path inside the same volume,
+so the durable queue comes back empty.
+
+With that in place, both halves hold. Measured:
+
+```text
+3 messages published, no worker running   ->  (3 waiting, 0 consumers)
+docker compose down && up                 ->  (3 waiting, 0 consumers)   survived
+consume and acknowledge all three         ->  (0 waiting, 0 consumers)
+docker compose down && up                 ->  (0 waiting, 0 consumers)   gone
+```
+
+Which is the distinction from Kafka in two lines: pending work survives, and
+completed work cannot be replayed. A queue is not a log.
 
 Rebuilding is not automatic, though. Restart Redis and the counters are gone;
 restart the pipeline and they stay gone, because the consumer group resumes from
@@ -423,6 +602,17 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:29092 --list
 ```
 
+RabbitMQ follows the same pattern: `localhost:5672` from the host,
+`rabbitmq:5672` from inside the network, with the management UI published
+separately at [localhost:15672](http://localhost:15672).
+
+It also needs a real user, which the others do not. RabbitMQ's built-in `guest`
+account may only connect over the broker's own loopback interface, so a client
+in a sibling container using it would be refused — the documented
+`rabbitmq:5672` address would not work. Compose creates a `pipeline` user
+instead, which is also the management UI login. These are local demonstration
+credentials and nothing more.
+
 ## KRaft, and where ZooKeeper went
 
 Kafka 4.x runs KRaft only: ZooKeeper mode was deprecated in 3.5 and removed in
@@ -456,9 +646,9 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_c31da1e2, committed offsets advanced 106 to 317, 4 page counters, 338 last-page values, and rows in smoke_ba0870d4, and nothing was left running
+PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_8f3413ef, committed offsets advanced 113 to 339, 4 page counters, 346 last-page values, rows in smoke_8f3413ef, and 347 job(s) across 347 event(s) completed by 4 workers, and nothing was left running
 
-all 4 checks passed in 21.8s
+all 4 checks passed in 23.1s
 ```
 
 On a brand new cluster you will also see `NotCoordinatorError` once or twice
@@ -471,14 +661,18 @@ own four partitions, confirms committed offsets advance, and stops it again. The
 other three build their own clients, so they would all pass with a broken
 Procfile.
 
-It runs against a topic, consumer group, Redis key prefix and Cassandra keyspace
-created for that run alone, all handed to Honcho through the environment. Sharing `pageviews` and the `pipeline` group
+It runs against a topic, consumer group, Redis key prefix, Cassandra keyspace
+and RabbitMQ queue created for that run alone, all handed to Honcho through the
+environment. Sharing `pageviews` and the `pipeline` group
 would let a topology you happen to have running satisfy the check — and a live
 `honcho` process is not evidence that the members being observed are its own.
-It asserts both Redis branches and that rows reached Cassandra with their key
-columns populated, so the release cannot ship with any of its writes silently
-not happening. Keys and keyspace are cleared only after the consumers have
-stopped, or a live one would write them straight back.
+It asserts both Redis branches, that rows reached Cassandra with their key
+columns populated, that exactly four workers were consuming the run's queue, and
+that jobs actually completed — so the release cannot ship with any of its writes
+silently not happening. Publishing without a worker completing anything would
+otherwise pass. Everything it created for the run — Redis keys, Cassandra
+keyspace, RabbitMQ queue and Kafka topic — is removed only after the topology
+has stopped, or a live consumer or worker would write straight back into it.
 
 CI runs these as two jobs. `quality` covers linting, formatting, unit tests and
 Compose parsing; `integration` starts the real topology and runs the smoke test.
@@ -489,7 +683,7 @@ published only after both tag workflows pass.
 ## Project structure
 
 ```text
-docker-compose.yml       Kafka in KRaft mode, Redis, and Cassandra
+docker-compose.yml       Kafka in KRaft mode, Redis, Cassandra, and RabbitMQ
 cassandra_schema.cql     the keyspace and table, applied by create-schema
 src/pipeline/
     __init__.py          logging setup and connection retry
@@ -502,6 +696,9 @@ src/pipeline/
     schema.py            the one path that creates keyspaces and tables
     counters.py          prints the Redis counters and their total
     events.py            reads back what Cassandra stored
+    jobs_queue.py        one queue declaration, used by publisher and workers
+    worker.py            competes for the queue, does slow work, acknowledges
+    jobs.py              queue depth and completed executions
     smoke_test.py        bounded assertions against a running broker
 tests/
 Procfile                 the processes that make up the running system

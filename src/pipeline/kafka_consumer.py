@@ -5,7 +5,7 @@ from contextlib import ExitStack
 
 from kafka import KafkaConsumer
 
-from pipeline import cassandra_store, wait_for_connection, wait_for_topic
+from pipeline import cassandra_store, jobs_queue, wait_for_connection, wait_for_topic
 from pipeline.config import (
     CASSANDRA_KEYSPACE,
     COMMIT_EVERY,
@@ -41,7 +41,7 @@ def connect() -> KafkaConsumer:
     )
 
 
-def handle(message, redis_client, session, insert) -> None:
+def handle(message, redis_client, session, insert, channel) -> None:
     """The work: apply one event to both stores, then log what happened.
 
     All of this runs before the offset is committed, which is what makes a
@@ -49,11 +49,15 @@ def handle(message, redis_client, session, insert) -> None:
     is up to the write, not the delivery: the Redis counter climbs, the
     Cassandra row is replaced.
 
-    The three writes are individually atomic and not atomic together. A failure
-    between them leaves partial state — see the README.
+    Four writes now, still not atomic together. The window between the publish
+    and the commit is the one that matters most: a crash there means the job
+    runs, and then runs again after the replay.
     """
     record_pageview(redis_client, message.value)
     cassandra_store.record_pageview(session, insert, message.value)
+    # Raises if the publish is not confirmed as routed, so the offset below is
+    # not committed and the event is redelivered.
+    jobs_queue.publish(channel, message.value)
     logger.info(
         f"Consumed (partition {message.partition}, offset {message.offset}): "
         f"{message.value}"
@@ -65,12 +69,13 @@ def consume_forever(
     redis_client,
     session,
     insert,
+    channel,
     commit_every: int = COMMIT_EVERY,
     crash_after: int | None = CONSUMER_CRASH_AFTER,
 ) -> None:
     processed = 0
     for message in consumer:
-        handle(message, redis_client, session, insert)
+        handle(message, redis_client, session, insert, channel)
         processed += 1
 
         # The work happened before the commit, so a crash here replays it.
@@ -107,11 +112,14 @@ def main() -> int:
 
         insert = cassandra_store.prepare_insert(session)
 
+        publisher, channel = jobs_queue.open_publisher()
+        resources.callback(publisher.close)
+
         consumer = connect()
         resources.callback(consumer.close)
 
         try:
-            consume_forever(consumer, redis_client, session, insert)
+            consume_forever(consumer, redis_client, session, insert, channel)
         except KeyboardInterrupt:
             logger.info("Shutting down consumer")
     return 0

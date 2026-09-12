@@ -22,6 +22,14 @@ class FakeRedis:
     def get(self, key):
         return self.store.get(key)
 
+    def hincrby(self, key, field, amount):
+        bucket = self.store.setdefault(key, {})
+        bucket[field] = bucket.get(field, 0) + amount
+        return bucket[field]
+
+    def hgetall(self, key):
+        return dict(self.store.get(key, {}))
+
     def delete(self, key):
         return 1 if self.store.pop(key, None) is not None else 0
 
@@ -42,6 +50,7 @@ def test_keys_carry_the_prefix():
     )
 
 
+@pytest.mark.allow_connect
 def test_connect_pings_before_returning(monkeypatch):
     """A lazy client constructs fine with nothing listening; PING is the proof."""
     client = FakeRedis()
@@ -53,6 +62,7 @@ def test_connect_pings_before_returning(monkeypatch):
     assert client.pinged is True
 
 
+@pytest.mark.allow_connect
 def test_connect_retries_until_the_ping_succeeds(monkeypatch):
     attempts = []
 
@@ -152,6 +162,7 @@ def test_clear_refuses_an_empty_prefix():
     assert redis_store.page_counts(client, "mine:") == {"/pricing": 1}
 
 
+@pytest.mark.allow_connect
 def test_connect_closes_a_client_whose_ping_failed(monkeypatch):
     """Each retry opens a client; a failed one must not leak its socket."""
     closed = []
@@ -179,3 +190,85 @@ def test_connect_closes_a_client_whose_ping_failed(monkeypatch):
     # The two failed clients were closed; the successful one is left open.
     assert len(closed) == 2
     assert returned not in closed
+
+
+def test_recording_an_execution_counts_total_and_per_event():
+    client = FakeRedis()
+
+    redis_store.record_execution(client, "e1", prefix="p:")
+    redis_store.record_execution(client, "e1", prefix="p:")
+    redis_store.record_execution(client, "e2", prefix="p:")
+
+    completed, runs = redis_store.job_summary(client, "p:")
+
+    assert completed == 3
+    assert runs == {"e1": 2, "e2": 1}
+
+
+def test_job_counters_are_isolated_by_prefix():
+    client = FakeRedis()
+
+    redis_store.record_execution(client, "e1", prefix="mine:")
+    redis_store.record_execution(client, "e1", prefix="theirs:")
+
+    assert redis_store.job_summary(client, "mine:") == (1, {"e1": 1})
+
+
+def test_no_jobs_completed_reads_as_zero():
+    assert redis_store.job_summary(FakeRedis(), "p:") == (0, {})
+
+
+def test_the_two_figures_cannot_disagree():
+    """Both come from one hash, so a crash cannot leave a total ahead of it.
+
+    An earlier version stored a separate total and incremented both; a worker
+    dying between the two commands left them permanently inconsistent.
+    """
+    client = FakeRedis()
+    redis_store.record_execution(client, "e1", prefix="p:")
+    redis_store.record_execution(client, "e1", prefix="p:")
+    redis_store.record_execution(client, "e2", prefix="p:")
+
+    completed, runs = redis_store.job_summary(client, "p:")
+
+    assert completed == sum(runs.values())
+    assert not hasattr(redis_store, "JOBS_COMPLETED_KEY")
+    # The separate total is gone, so nothing can hold a stale copy of it.
+    assert not hasattr(redis_store, "jobs_completed")
+
+
+def test_recording_uses_a_single_command(monkeypatch):
+    """One command, so there is no window between two writes to die in."""
+    calls = []
+
+    class Counting(FakeRedis):
+        def hincrby(self, key, field, amount):
+            calls.append("hincrby")
+            return super().hincrby(key, field, amount)
+
+        def incr(self, key):
+            calls.append("incr")
+            return super().incr(key)
+
+    redis_store.record_execution(Counting(), "e1", prefix="p:")
+
+    assert calls == ["hincrby"]
+
+
+def test_a_summary_read_takes_one_snapshot():
+    """The helper both production paths use must read exactly once.
+
+    Testing the sequence by hand would pass even if a caller regressed to two
+    reads, so this exercises job_summary itself.
+    """
+    client = FakeRedis()
+    redis_store.record_execution(client, "e1", prefix="p:")
+
+    reads = []
+    original = client.hgetall
+    client.hgetall = lambda key: (reads.append(key), original(key))[1]
+
+    completed, runs = redis_store.job_summary(client, "p:")
+
+    assert len(reads) == 1
+    assert (completed, runs) == (1, {"e1": 1})

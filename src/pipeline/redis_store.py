@@ -17,6 +17,7 @@ logger = logging.getLogger("redis-store")
 
 PAGE_COUNT_PREFIX = "pageviews:"
 LAST_PAGE_PREFIX = "user:last_page:"
+JOBS_RUNS_KEY = "jobs:runs"
 
 
 def page_count_key(page: str, prefix: str = REDIS_KEY_PREFIX) -> str:
@@ -108,3 +109,48 @@ def clear(client: redis.Redis, prefix: str) -> int:
     for key in client.scan_iter(match=f"{prefix}*", count=100):
         removed += client.delete(key)
     return removed
+
+
+def jobs_runs_key(prefix: str = REDIS_KEY_PREFIX) -> str:
+    return f"{prefix}{JOBS_RUNS_KEY}"
+
+
+def record_execution(
+    client: redis.Redis, event_id: str, prefix: str = REDIS_KEY_PREFIX
+) -> None:
+    """Record that a job ran.
+
+    Queue depth cannot answer "how much work completed" — acknowledged messages
+    are simply gone — so completions are counted here instead.
+
+    **One command, deliberately.** An earlier version incremented a total and a
+    per-event hash separately; a worker dying between the two left the total
+    ahead of the per-event counts forever, which is 0.4's two-command trap
+    recreated in the instrumentation. The total is derived from the hash instead.
+
+    What remains true: this is a non-idempotent side effect recording a
+    non-idempotent side effect. A worker dying between this call and its
+    acknowledgement runs the work again and counts it again — evidence for the
+    lesson, but it does mean the number is not ground truth.
+    """
+    client.hincrby(jobs_runs_key(prefix), event_id, 1)
+
+
+def job_runs(client: redis.Redis, prefix: str = REDIS_KEY_PREFIX) -> dict[str, int]:
+    """How many times each event's job has been executed."""
+    raw = client.hgetall(jobs_runs_key(prefix))
+    return {event_id: int(count) for event_id, count in raw.items()}
+
+
+def job_summary(
+    client: redis.Redis, prefix: str = REDIS_KEY_PREFIX
+) -> tuple[int, dict[str, int]]:
+    """Total executions and per-event counts, from one snapshot.
+
+    Both figures come from a single read on purpose. Asking for them separately
+    takes two snapshots, and a worker finishing in between reports a total that
+    does not match the counts beside it. Every caller uses this rather than
+    composing its own pair of reads.
+    """
+    runs = job_runs(client, prefix)
+    return sum(runs.values()), runs

@@ -20,6 +20,10 @@ logging.getLogger("kafka").setLevel(logging.WARNING)
 # every partition, which is worth hearing.
 logging.getLogger("cassandra").setLevel(logging.WARNING)
 
+# pika narrates every connection, channel and socket transition at INFO, which
+# is many lines per run and none of them about this pipeline.
+logging.getLogger("pika").setLevel(logging.WARNING)
+
 logger = logging.getLogger("pipeline")
 
 

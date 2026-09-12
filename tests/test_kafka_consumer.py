@@ -26,6 +26,16 @@ class FakeRedis:
         self.set_values[key] = value
 
 
+class FakeChannel:
+    """Stands in for the RabbitMQ publishing channel."""
+
+    def __init__(self):
+        self.published = []
+
+    def basic_publish(self, exchange, routing_key, body, properties, mandatory=False):
+        self.published.append(routing_key)
+
+
 class FakeSession:
     """Records Cassandra writes so a test can count rows rather than calls."""
 
@@ -75,6 +85,7 @@ def test_consumes_every_message(caplog):
             FakeRedis(),
             FakeSession(),
             "insert",
+            FakeChannel(),
             commit_every=10,
             crash_after=None,
         )
@@ -86,7 +97,13 @@ def test_commits_once_per_batch():
     consumer = FakeConsumer(messages(10))
 
     kafka_consumer.consume_forever(
-        consumer, FakeRedis(), FakeSession(), "insert", commit_every=5, crash_after=None
+        consumer,
+        FakeRedis(),
+        FakeSession(),
+        "insert",
+        FakeChannel(),
+        commit_every=5,
+        crash_after=None,
     )
 
     assert consumer.commits == 2
@@ -97,7 +114,13 @@ def test_does_not_commit_a_partial_batch():
     consumer = FakeConsumer(messages(7))
 
     kafka_consumer.consume_forever(
-        consumer, FakeRedis(), FakeSession(), "insert", commit_every=5, crash_after=None
+        consumer,
+        FakeRedis(),
+        FakeSession(),
+        "insert",
+        FakeChannel(),
+        commit_every=5,
+        crash_after=None,
     )
 
     assert consumer.commits == 1
@@ -120,6 +143,7 @@ def test_crash_injection_exits_without_committing(monkeypatch):
             FakeRedis(),
             FakeSession(),
             "insert",
+            FakeChannel(),
             commit_every=5,
             crash_after=3,
         )
@@ -143,6 +167,7 @@ def test_crash_after_a_commit_leaves_the_committed_work_alone(monkeypatch):
             FakeRedis(),
             FakeSession(),
             "insert",
+            FakeChannel(),
             commit_every=5,
             crash_after=7,
         )
@@ -160,6 +185,7 @@ def test_commit_every_controls_the_duplicate_window(commit_every):
         FakeRedis(),
         FakeSession(),
         "insert",
+        FakeChannel(),
         commit_every=commit_every,
         crash_after=None,
     )
@@ -199,6 +225,7 @@ def test_crash_on_a_commit_boundary_reports_a_full_batch_pending(monkeypatch, ca
             FakeRedis(),
             FakeSession(),
             "insert",
+            FakeChannel(),
             commit_every=5,
             crash_after=5,
         )
@@ -227,6 +254,7 @@ def test_uncommitted_count_is_never_zero(
             FakeRedis(),
             FakeSession(),
             "insert",
+            FakeChannel(),
             commit_every=commit_every,
             crash_after=crash_after,
         )
