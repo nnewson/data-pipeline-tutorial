@@ -147,7 +147,30 @@ services:
       retries: 10
       start_period: 30s
 
+  zookeeper:
+    image: zookeeper:3.9
+    ports:
+      - "2181:2181"
+    volumes:
+      # Two, not one: the official image keeps snapshots in /data and the
+      # transaction log in /datalog, and both are needed for persistent znodes
+      # to survive. Ephemeral znodes are not meant to survive — they die with
+      # the session that made them, which is the point of them.
+      - zookeeper-data:/data
+      - zookeeper-datalog:/datalog
+    healthcheck:
+      # Not `echo ruok | nc`: the official image ships with four-letter commands
+      # disabled, and answers "ruok is not executed because it is not in the
+      # whitelist". zkServer.sh status exits 0 when the server is serving.
+      test: ["CMD", "./bin/zkServer.sh", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
 volumes:
   kafka-data:
   cassandra-data:
   rabbitmq-data:
+  zookeeper-data:
+  zookeeper-datalog:

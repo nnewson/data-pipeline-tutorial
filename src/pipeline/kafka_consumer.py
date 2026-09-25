@@ -1,11 +1,18 @@
 import json
 import logging
 import os
+import socket
 from contextlib import ExitStack
 
 from kafka import KafkaConsumer
 
-from pipeline import cassandra_store, jobs_queue, wait_for_connection, wait_for_topic
+from pipeline import (
+    cassandra_store,
+    coordination,
+    jobs_queue,
+    wait_for_connection,
+    wait_for_topic,
+)
 from pipeline.config import (
     CASSANDRA_KEYSPACE,
     COMMIT_EVERY,
@@ -18,6 +25,12 @@ from pipeline.redis_store import connect as connect_redis
 from pipeline.redis_store import record_pageview
 
 logger = logging.getLogger("consumer")
+
+
+def identity() -> str:
+    """Unique per process, so four identical consumers do not collide."""
+    return f"{socket.gethostname()}-{os.getpid()}"
+
 
 # One group, so the four consumers divide the partitions rather than each
 # receiving every event. Its name comes from config, so a smoke run can isolate
@@ -114,6 +127,21 @@ def main() -> int:
 
         publisher, channel = jobs_queue.open_publisher()
         resources.callback(publisher.close)
+
+        # Register presence, so the tree shows which sessions are holding a
+        # consumer. Re-registered automatically if the session is lost.
+        zk = coordination.connect()
+        resources.callback(zk.close)
+        resources.callback(zk.stop)
+        paths = coordination.Paths()
+        coordination.wait_for_initialisation(zk, paths)
+        presence = coordination.Presence(zk, paths, "consumer", identity())
+        zk.add_listener(presence.on_state)
+        resources.callback(presence.stop)
+        if not presence.start(group=CONSUMER_GROUP):
+            raise RuntimeError(
+                f"could not register as a consumer under {paths.registry}"
+            )
 
         consumer = connect()
         resources.callback(consumer.close)
