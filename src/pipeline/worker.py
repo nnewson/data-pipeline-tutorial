@@ -12,17 +12,26 @@ order.
 
 import json
 import logging
+import os
+import socket
 import time
 from contextlib import ExitStack
 
-from pipeline import jobs_queue, redis_store
+from pipeline import coordination, jobs_queue, redis_store
 from pipeline.config import (
     RABBITMQ_QUEUE,
     WORKER_DELAY_SECONDS,
     WORKER_PREFETCH,
 )
+from pipeline.coordination import Paths
+from pipeline.runtime_config import RuntimeConfig
 
 logger = logging.getLogger("worker")
+
+
+def identity() -> str:
+    """Unique per process, so four identical workers do not collide."""
+    return f"{socket.gethostname()}-{os.getpid()}"
 
 
 def do_work(delay: float = WORKER_DELAY_SECONDS) -> None:
@@ -65,6 +74,50 @@ def main() -> int:
         redis_client = redis_store.connect()
         resources.callback(redis_client.close)
 
+        # Live settings, so a change lands on the next job rather than the next
+        # restart.
+        settings = RuntimeConfig(WORKER_DELAY_SECONDS)
+        paths = Paths()
+        zk = coordination.connect()
+        resources.callback(zk.close)
+        resources.callback(zk.stop)
+        coordination.wait_for_initialisation(zk, paths)
+
+        presence = coordination.Presence(zk, paths, "worker", identity())
+        # Listener first, then start: registering before the listener exists
+        # leaves a window where a session loss would go unnoticed.
+        zk.add_listener(presence.on_state)
+        resources.callback(presence.stop)
+        if not presence.start(
+            delay=settings.worker_delay, config_version=settings.version
+        ):
+            # Part of the startup barrier, like the topic and the schema. A
+            # worker doing work while absent from the registry makes the tree
+            # under-report exactly when something is wrong. After startup a
+            # session loss is survivable: Presence re-registers in the
+            # background while the data path keeps running.
+            raise RuntimeError(f"could not register as a worker under {paths.registry}")
+
+        def adopt(raw: str, version: int) -> None:
+            settings.apply(raw, version)
+            # Report what was applied, so a test can prove every worker took it
+            # rather than inferring from aggregate throughput.
+            presence.update(
+                delay=settings.worker_delay, config_version=settings.version
+            )
+
+        watcher = coordination.ConfigWatcher(zk, paths.worker_delay, adopt)
+        zk.add_listener(watcher.on_state)
+        resources.callback(watcher.stop)
+        # Waits for the published value to be applied. Consuming on the
+        # environment default would make the live-config demonstration a lie,
+        # so a failure here is refused rather than logged and ignored.
+        if not watcher.start():
+            raise RuntimeError(
+                f"no worker delay applied from {paths.worker_delay}; "
+                "run `uv run cluster init`"
+            )
+
         connection = jobs_queue.connect()
         resources.callback(connection.close)
 
@@ -75,7 +128,13 @@ def main() -> int:
         channel.basic_consume(
             queue=RABBITMQ_QUEUE,
             on_message_callback=lambda ch, method, properties, body: handle_job(
-                redis_client, ch, method, properties, body
+                # Read as the job begins: that is what makes the setting live.
+                redis_client,
+                ch,
+                method,
+                properties,
+                body,
+                delay=settings.worker_delay,
             ),
         )
 

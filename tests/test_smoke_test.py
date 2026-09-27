@@ -348,119 +348,6 @@ def test_group_readers_propagate_failure_rather_than_raising(monkeypatch, reader
     assert error
 
 
-PS_TABLE = """
-  100     1   100
-  200   100   200
-  300   200   300
-  400     1   400
-"""
-
-
-def test_topology_groups_collects_every_group_below_the_parent(monkeypatch):
-    """Honcho's own group is not enough: each child has a group of its own."""
-    monkeypatch.setattr(smoke_test.subprocess, "run", _run_returning(stdout=PS_TABLE))
-
-    groups, error = smoke_test._topology_groups(100)
-
-    assert groups == {100, 200, 300}
-    assert error == ""
-
-
-def test_topology_groups_excludes_unrelated_processes(monkeypatch):
-    monkeypatch.setattr(smoke_test.subprocess, "run", _run_returning(stdout=PS_TABLE))
-
-    groups, _ = smoke_test._topology_groups(100)
-
-    assert 400 not in groups
-
-
-def test_topology_groups_deduplicates_a_shared_group(monkeypatch):
-    shared = """
-  100     1   100
-  200   100   100
-  300   100   100
-"""
-    monkeypatch.setattr(smoke_test.subprocess, "run", _run_returning(stdout=shared))
-
-    groups, _ = smoke_test._topology_groups(100)
-
-    assert groups == {100}
-
-
-@pytest.mark.parametrize(
-    ("failure", "expected"),
-    [
-        (FileNotFoundError(), "ps is not available"),
-        (subprocess.TimeoutExpired(cmd="ps", timeout=1), "timed out"),
-    ],
-)
-def test_topology_groups_reports_a_failed_snapshot(monkeypatch, failure, expected):
-    """An empty snapshot must never be mistaken for a clean shutdown."""
-
-    def fail(*args, **kwargs):
-        raise failure
-
-    monkeypatch.setattr(smoke_test.subprocess, "run", fail)
-
-    groups, error = smoke_test._topology_groups(100)
-
-    assert groups == set()
-    assert expected in error
-
-
-def test_topology_groups_reports_an_absent_root(monkeypatch):
-    """Valid ps output that does not contain Honcho is not an empty topology.
-
-    If Honcho exits between observation and snapshot, its children may still be
-    running with the link to them gone.
-    """
-    monkeypatch.setattr(smoke_test.subprocess, "run", _run_returning(stdout=PS_TABLE))
-
-    groups, error = smoke_test._topology_groups(999)
-
-    assert groups == set()
-    assert "999 was absent" in error
-
-
-def test_topology_groups_reports_a_non_zero_ps_exit(monkeypatch):
-    monkeypatch.setattr(
-        smoke_test.subprocess,
-        "run",
-        _run_returning(returncode=1, stderr="ps exploded"),
-    )
-
-    groups, error = smoke_test._topology_groups(100)
-
-    assert groups == set()
-    assert "ps exploded" in error
-
-
-def test_process_group_is_empty_when_the_group_is_gone(monkeypatch):
-    def gone(pgid, sig):
-        raise ProcessLookupError
-
-    monkeypatch.setattr(smoke_test.os, "killpg", gone)
-
-    assert smoke_test._process_group_is_empty(999) is True
-
-
-def test_process_group_is_not_empty_while_processes_remain(monkeypatch):
-    monkeypatch.setattr(smoke_test.os, "killpg", lambda pgid, sig: None)
-
-    assert smoke_test._process_group_is_empty(999) is False
-
-
-def test_process_group_permission_denied_means_still_there(monkeypatch):
-    """Cannot signal it, but something is holding the group: not empty."""
-
-    def denied(pgid, sig):
-        raise PermissionError
-
-    monkeypatch.setattr(smoke_test.os, "killpg", denied)
-
-    assert smoke_test._process_group_is_empty(999) is False
-
-
 class FakeHoncho:
     """Stands in for a running Honcho process."""
 
@@ -491,9 +378,165 @@ def _topology_scaffold(monkeypatch, stop_result):
     monkeypatch.setattr(smoke_test, "_stop_topology", lambda process: stop_result)
 
 
+def _state(
+    leader_epoch=2,
+    workers=4,
+    consumers=4,
+    coordinators=3,
+    contenders=3,
+    snapshot_epoch=2,
+    version=5,
+    leader="host-1",
+):
+    return {
+        "leader": {"identity": leader, "epoch": leader_epoch} if leader else None,
+        "contenders": contenders,
+        "workers": [{"identity": f"w{n}"} for n in range(workers)],
+        "consumers": [{"identity": f"c{n}"} for n in range(consumers)],
+        "coordinators": [{"identity": "host-1"}]
+        + [{"identity": f"co{n}"} for n in range(coordinators - 1)],
+        "snapshot": {"epoch": snapshot_epoch},
+        "snapshot_version": version,
+    }
+
+
+def _zookeeper_predicate(monkeypatch, state, first=None):
+    monkeypatch.setattr(smoke_test, "_coordination_state", lambda root: (state, ""))
+    predicates = smoke_test._readiness(
+        "grp", "p:", "ks", "q", "/root", first if first is not None else {}
+    )
+    return dict(predicates)["zookeeper"]
+
+
+def test_readiness_requires_an_acknowledged_leader(monkeypatch):
+    """Contenders are candidates, not leaders; a contender count proves nothing."""
+    ready, detail = _zookeeper_predicate(monkeypatch, _state(leader=None))()
+
+    assert ready is False
+    assert "no acknowledged leader among 3 contenders" in detail
+
+
+def test_readiness_requires_every_worker_registered(monkeypatch):
+    ready, detail = _zookeeper_predicate(monkeypatch, _state(workers=2))()
+
+    assert ready is False
+    assert "2 worker registrations, expected 4" in detail
+
+
+def test_readiness_requires_the_snapshot_to_match_the_leaders_epoch(monkeypatch):
+    """A snapshot from a previous epoch is a stale leader's work."""
+    ready, detail = _zookeeper_predicate(
+        monkeypatch, _state(leader_epoch=3, snapshot_epoch=2)
+    )()
+
+    assert ready is False
+    assert "snapshot epoch 2 does not match leader epoch 3" in detail
+
+
+def test_readiness_passes_with_one_leader_and_a_matching_snapshot(monkeypatch):
+    ready, detail = _zookeeper_predicate(monkeypatch, _state())()
+
+    assert ready is True
+    assert "one leader at epoch 2" in detail
+
+
+def test_readiness_reports_a_zookeeper_failure(monkeypatch):
+    monkeypatch.setattr(
+        smoke_test, "_coordination_state", lambda root: (None, "could not connect")
+    )
+    predicate = dict(smoke_test._readiness("grp", "p:", "ks", "q", "/root", {}))[
+        "zookeeper"
+    ]
+
+    ready, detail = predicate()
+
+    assert ready is False
+    assert "could not connect" in detail
+
+
+def test_a_second_snapshot_must_actually_be_new(monkeypatch):
+    """Reading the same znode twice is not two snapshots."""
+    first = {"version": 5, "leader": {"identity": "host-1", "epoch": 2}}
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        smoke_test, "_coordination_state", lambda root: (_state(version=5), "")
+    )
+    monkeypatch.setattr(smoke_test, "TOPOLOGY_PROGRESS_SECONDS", 0.05)
+
+    ready, detail = smoke_test._leader_is_working("/root", first)
+
+    assert ready is False
+    assert "did not write a second snapshot" in detail
+
+
+def test_a_new_snapshot_from_the_same_leader_and_epoch_passes(monkeypatch):
+    first = {"version": 5, "leader": {"identity": "host-1", "epoch": 2}}
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        smoke_test, "_coordination_state", lambda root: (_state(version=6), "")
+    )
+
+    ready, detail = smoke_test._leader_is_working("/root", first)
+
+    assert ready is True
+    assert "v5 -> v6" in detail
+
+
+def test_a_new_snapshot_from_a_different_leader_does_not_count(monkeypatch):
+    """Leadership changing mid-check is not the same leader working."""
+    first = {"version": 5, "leader": {"identity": "host-1", "epoch": 2}}
+    state = _state(version=6)
+    state["leader"] = {"identity": "host-2", "epoch": 3}
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda s: None)
+    monkeypatch.setattr(smoke_test, "_coordination_state", lambda root: (state, ""))
+    monkeypatch.setattr(smoke_test, "TOPOLOGY_PROGRESS_SECONDS", 0.05)
+
+    ready, _ = smoke_test._leader_is_working("/root", first)
+
+    assert ready is False
+
+
+class FakeTopology:
+    """Stands in for the extracted runner."""
+
+    def __init__(self, ready=(True, "all held"), stop=(True, "")):
+        self._ready = ready
+        self._stop = stop
+        self.stopped = False
+
+    def start(self):
+        return ""
+
+    def died(self):
+        return ""
+
+    def wait_until_ready(self, predicates, timeout):
+        return self._ready
+
+    def stop(self):
+        self.stopped = True
+        return self._stop
+
+
+def _topology_scaffold(monkeypatch, topology):
+    monkeypatch.setattr(smoke_test, "_prepare_topology", lambda *a: "")
+    monkeypatch.setattr(smoke_test, "Topology", lambda env: topology)
+    monkeypatch.setattr(smoke_test, "_leader_is_working", lambda *a: (True, "led"))
+    monkeypatch.setattr(
+        smoke_test, "_live_config_reaches_workers", lambda root: (True, "config")
+    )
+    for name in (
+        "_clear_redis_prefix",
+        "_drop_keyspace",
+        "_delete_queue",
+        "_delete_zookeeper_root",
+        "_delete_topic",
+    ):
+        monkeypatch.setattr(smoke_test, name, lambda *a, **k: None)
+
+
 def test_a_failed_shutdown_outranks_a_passing_observation(monkeypatch):
-    _topology_scaffold(monkeypatch, stop_result=(False, ""))
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "all good"))
+    _topology_scaffold(monkeypatch, FakeTopology(stop=(False, "")))
 
     passed, detail = smoke_test.honcho_topology_does_the_work()
 
@@ -501,22 +544,12 @@ def test_a_failed_shutdown_outranks_a_passing_observation(monkeypatch):
     assert "did not stop" in detail
 
 
-def test_a_failed_shutdown_is_reported_even_when_the_observation_failed(monkeypatch):
-    """An early failure return must not hide that processes were left behind."""
-    _topology_scaffold(monkeypatch, stop_result=(False, "group 42 still had processes"))
-    monkeypatch.setattr(
-        smoke_test, "_observe_topology", lambda *a: (False, "did not settle")
+def test_a_failed_shutdown_is_reported_even_when_readiness_failed(monkeypatch):
+    """An early failure must not hide that processes were left behind."""
+    _topology_scaffold(
+        monkeypatch,
+        FakeTopology(ready=(False, "zookeeper: no leader"), stop=(False, "group 42")),
     )
-
-    passed, detail = smoke_test.honcho_topology_does_the_work()
-
-    assert passed is False
-    assert "shutdown incomplete" in detail
-
-
-def test_unverifiable_shutdown_fails_even_when_everything_else_passed(monkeypatch):
-    _topology_scaffold(monkeypatch, stop_result=(False, "group 42 still had processes"))
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "all good"))
 
     passed, detail = smoke_test.honcho_topology_does_the_work()
 
@@ -525,10 +558,7 @@ def test_unverifiable_shutdown_fails_even_when_everything_else_passed(monkeypatc
 
 
 def test_a_clean_run_says_nothing_was_left_running(monkeypatch):
-    _topology_scaffold(monkeypatch, stop_result=(True, ""))
-    monkeypatch.setattr(
-        smoke_test, "_observe_topology", lambda *a: (True, "4 consumers owned 4")
-    )
+    _topology_scaffold(monkeypatch, FakeTopology())
 
     passed, detail = smoke_test.honcho_topology_does_the_work()
 
@@ -536,504 +566,177 @@ def test_a_clean_run_says_nothing_was_left_running(monkeypatch):
     assert "nothing was left running" in detail
 
 
-def test_the_topic_is_deleted_even_when_honcho_cannot_start(monkeypatch):
-    deleted = []
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(smoke_test, "_delete_topic", deleted.append)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
+def test_setup_failure_still_cleans_up(monkeypatch):
+    cleaned = []
+    monkeypatch.setattr(
+        smoke_test, "_prepare_topology", lambda *a: "cluster init path failed"
+    )
+    monkeypatch.setattr(smoke_test, "Topology", lambda env: FakeTopology())
+    for name in (
+        "_clear_redis_prefix",
+        "_drop_keyspace",
+        "_delete_queue",
+        "_delete_zookeeper_root",
+        "_delete_topic",
+    ):
+        monkeypatch.setattr(smoke_test, name, lambda *a, **k: cleaned.append(1))
 
-    def no_honcho(*args, **kwargs):
-        raise FileNotFoundError
+    passed, detail = smoke_test.honcho_topology_does_the_work()
 
-    monkeypatch.setattr(smoke_test.subprocess, "Popen", no_honcho)
+    assert passed is False
+    assert "cluster init path failed" in detail
+    assert len(cleaned) == 5
+
+
+def test_the_topology_gets_isolated_state(monkeypatch):
+    """Its own topic, group, prefix, keyspace, queue and ZooKeeper root."""
+    captured = {}
+    monkeypatch.setattr(smoke_test, "_prepare_topology", lambda *a: "")
+    monkeypatch.setattr(smoke_test, "_leader_is_working", lambda *a: (True, "led"))
+    monkeypatch.setattr(
+        smoke_test, "_live_config_reaches_workers", lambda root: (True, "config")
+    )
+    monkeypatch.setattr(
+        smoke_test, "Topology", lambda env: (captured.update(env), FakeTopology())[1]
+    )
+    for name in (
+        "_clear_redis_prefix",
+        "_drop_keyspace",
+        "_delete_queue",
+        "_delete_zookeeper_root",
+        "_delete_topic",
+    ):
+        monkeypatch.setattr(smoke_test, name, lambda *a, **k: None)
+
+    smoke_test.honcho_topology_does_the_work()
+
+    assert captured["KAFKA_TOPIC"].startswith("smoke_topology_")
+    assert captured["CONSUMER_GROUP"].startswith("smoke-topology-")
+    assert captured["REDIS_KEY_PREFIX"].startswith("smoke:")
+    assert captured["CASSANDRA_KEYSPACE"].startswith("smoke_")
+    assert captured["RABBITMQ_QUEUE"].startswith("smoke_jobs_")
+    assert captured["ZOOKEEPER_ROOT"].startswith("/smoke_")
+
+
+def test_everything_is_cleaned_up_when_honcho_cannot_start(monkeypatch):
+    """A failure to launch must still remove what setup created."""
+    cleaned = []
+
+    class WontStart(FakeTopology):
+        def start(self):
+            return ".venv/bin/honcho is missing"
+
+    monkeypatch.setattr(smoke_test, "_prepare_topology", lambda *a: "")
+    monkeypatch.setattr(smoke_test, "Topology", lambda env: WontStart())
+    for name in (
+        "_clear_redis_prefix",
+        "_drop_keyspace",
+        "_delete_queue",
+        "_delete_zookeeper_root",
+        "_delete_topic",
+    ):
+        monkeypatch.setattr(smoke_test, name, lambda *a, **k: cleaned.append(1))
 
     passed, detail = smoke_test.honcho_topology_does_the_work()
 
     assert passed is False
     assert "honcho is missing" in detail
-    assert len(deleted) == 1
+    assert len(cleaned) == 5
 
 
-def test_the_topic_is_deleted_when_it_cannot_be_created(monkeypatch):
-    deleted = []
+def test_readiness_requires_every_consumer_registered(monkeypatch):
+    """The previous version passed with zero consumers registered."""
+    ready, detail = _zookeeper_predicate(monkeypatch, _state(consumers=0))()
 
-    def cannot_create(*args, **kwargs):
-        raise RuntimeError("too many partitions")
-
-    monkeypatch.setattr(smoke_test, "ensure_topic", cannot_create)
-    monkeypatch.setattr(smoke_test, "_delete_topic", deleted.append)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
-
-    passed, detail = smoke_test.honcho_topology_does_the_work()
-
-    assert passed is False
-    assert "create-topics path failed" in detail
-    assert len(deleted) == 1
+    assert ready is False
+    assert "0 consumer registrations, expected 4" in detail
 
 
-class StoppableHoncho(FakeHoncho):
-    def __init__(self):
-        super().__init__(returncode=0)
-        # Matches the root pid in PS_TABLE, so the snapshot actually finds it.
-        self.pid = 100
-        self.waits = 0
+def test_readiness_requires_every_coordinator_registered(monkeypatch):
+    ready, detail = _zookeeper_predicate(monkeypatch, _state(coordinators=1))()
 
-    def wait(self, timeout=None):
-        self.waits += 1
-        return 0
+    assert ready is False
+    assert "coordinator registrations" in detail
 
 
-def _stop_scaffold(monkeypatch, table_stdout, empty_groups):
-    # Real-time deadline, so shrink it rather than spinning for 30 seconds.
-    monkeypatch.setattr(smoke_test, "HONCHO_STOP_TIMEOUT_SECONDS", 0.05)
+def test_readiness_requires_every_contender(monkeypatch):
+    ready, detail = _zookeeper_predicate(monkeypatch, _state(contenders=1))()
+
+    assert ready is False
+    assert "1 contenders, expected 3" in detail
+
+
+def test_the_leader_must_be_a_registered_coordinator(monkeypatch):
+    """A marker written by a process that then vanished is not a leader."""
+    ready, detail = _zookeeper_predicate(monkeypatch, _state(leader="ghost"))()
+
+    assert ready is False
+    assert "not among the registered coordinators" in detail
+
+
+def test_live_config_requires_every_worker_to_report_the_new_version(monkeypatch):
+    """Would pass on manual observation alone; must not pass if the path breaks."""
+
+    class Client:
+        def __init__(self):
+            self.versions = {}
+
+        def set(self, path, value):
+            class Stat:
+                version = 7
+
+            return Stat()
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(smoke_test.coordination, "connect", lambda: Client())
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda s: None)
+    monkeypatch.setattr(smoke_test, "LIVE_CONFIG_TIMEOUT_SECONDS", 0.05)
+    # Three of four applied it.
     monkeypatch.setattr(
-        smoke_test.subprocess, "run", _run_returning(stdout=table_stdout)
+        smoke_test.coordination,
+        "registrations",
+        lambda c, p, role: [
+            {"config_version": 7, "delay": "0.03"},
+            {"config_version": 7, "delay": "0.03"},
+            {"config_version": 7, "delay": "0.03"},
+            {"config_version": 1, "delay": "0.5"},
+        ],
     )
-    monkeypatch.setattr(smoke_test.os, "getpgid", lambda pid: 100)
-    monkeypatch.setattr(smoke_test.os, "killpg", lambda pgid, sig: None)
+
+    ready, detail = smoke_test._live_config_reaches_workers("/root")
+
+    assert ready is False
+    assert "did not all report config version 7" in detail
+
+
+def test_live_config_passes_when_all_four_applied_it(monkeypatch):
+    class Client:
+        def set(self, path, value):
+            class Stat:
+                version = 7
+
+            return Stat()
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(smoke_test.coordination, "connect", lambda: Client())
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda s: None)
     monkeypatch.setattr(
-        smoke_test, "_process_group_is_empty", lambda pgid: pgid in empty_groups
-    )
-    monkeypatch.setattr(smoke_test.time, "sleep", lambda seconds: None)
-
-
-def test_stop_topology_passes_when_every_group_is_gone(monkeypatch):
-    _stop_scaffold(monkeypatch, PS_TABLE, empty_groups={100, 200, 300})
-
-    stopped, error = smoke_test._stop_topology(StoppableHoncho())
-
-    assert stopped is True
-    assert error == ""
-
-
-def test_stop_topology_fails_when_a_worker_group_survives(monkeypatch):
-    """The regression this guards: Honcho exits, its group empties, work goes on."""
-    _stop_scaffold(monkeypatch, PS_TABLE, empty_groups={100, 200})
-
-    stopped, error = smoke_test._stop_topology(StoppableHoncho())
-
-    assert stopped is False
-    assert "still running after shutdown: [300]" in error
-
-
-def test_stop_topology_reaps_honcho(monkeypatch):
-    """An unreaped zombie would keep its own group looking occupied."""
-    _stop_scaffold(monkeypatch, PS_TABLE, empty_groups={100, 200, 300})
-    honcho = StoppableHoncho()
-
-    smoke_test._stop_topology(honcho)
-
-    assert honcho.waits >= 1
-
-
-def test_stop_topology_still_shuts_down_when_the_snapshot_fails(monkeypatch):
-    """Shutdown proceeds; the assertion fails afterwards."""
-    signalled = []
-
-    def no_ps(*args, **kwargs):
-        raise FileNotFoundError
-
-    monkeypatch.setattr(smoke_test, "HONCHO_STOP_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(smoke_test.subprocess, "run", no_ps)
-    monkeypatch.setattr(smoke_test.os, "getpgid", lambda pid: 100)
-    monkeypatch.setattr(
-        smoke_test.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
-    )
-    honcho = StoppableHoncho()
-
-    stopped, error = smoke_test._stop_topology(honcho)
-
-    assert stopped is False
-    assert "ps is not available" in error
-    assert signalled, "honcho should still have been signalled"
-    assert honcho.waits >= 1
-
-
-def test_stop_topology_never_signals_a_captured_group(monkeypatch):
-    """Captured groups are observed, never signalled, so PGID reuse is safe."""
-    signalled = []
-    monkeypatch.setattr(smoke_test.subprocess, "run", _run_returning(stdout=PS_TABLE))
-    monkeypatch.setattr(smoke_test.os, "getpgid", lambda pid: 100)
-    monkeypatch.setattr(
-        smoke_test.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
-    )
-    monkeypatch.setattr(smoke_test, "_process_group_is_empty", lambda pgid: True)
-    monkeypatch.setattr(smoke_test.time, "sleep", lambda seconds: None)
-
-    smoke_test._stop_topology(StoppableHoncho())
-
-    # Only Honcho's own group (100) is ever signalled; 200 and 300 are not.
-    assert {pgid for pgid, _ in signalled} == {100}
-
-
-def _observed_scaffold(monkeypatch, redis_state):
-    """Drive _observe_topology past the Kafka assertions to the Redis ones."""
-    monkeypatch.setattr(
-        smoke_test, "_group_members", lambda g: ({"a", "b", "c", "d"}, "")
-    )
-    monkeypatch.setattr(
-        smoke_test, "_group_offsets", lambda g: ({0: 1, 1: 1, 2: 1, 3: 1}, "")
-    )
-    monkeypatch.setattr(smoke_test, "TOPOLOGY_PROGRESS_SECONDS", 0)
-    monkeypatch.setattr(smoke_test.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(smoke_test, "_redis_state", lambda prefix: redis_state)
-    monkeypatch.setattr(smoke_test, "_queue_consumers", lambda queue: (4, ""))
-    monkeypatch.setattr(smoke_test, "_job_state", lambda prefix: (7, {"e1": 1}, ""))
-
-    class Row:
-        user_id = "ada"
-        event_time = "t"
-        event_id = "e1"
-        page = "/docs"
-
-    monkeypatch.setattr(smoke_test, "_cassandra_rows", lambda keyspace: ([Row()], ""))
-    # Offsets must appear to advance for the check to reach Redis at all.
-    offsets = iter([({0: 1, 1: 1, 2: 1, 3: 1}, ""), ({0: 9, 1: 9, 2: 9, 3: 9}, "")])
-    monkeypatch.setattr(smoke_test, "_group_offsets", lambda g: next(offsets))
-
-
-def test_observe_reports_missing_counters(monkeypatch):
-    """The INCR half silently not running must fail the check."""
-    _observed_scaffold(monkeypatch, redis_state=({}, {"ada": "/docs"}, ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
+        smoke_test.coordination,
+        "registrations",
+        lambda c, p, role: [{"config_version": 7, "delay": "0.03"}] * 4,
     )
 
-    assert passed is False
-    assert "no smoke:abc:pageviews:* counters" in detail
+    ready, detail = smoke_test._live_config_reaches_workers("/root")
 
-
-def test_observe_reports_missing_last_page_values(monkeypatch):
-    """The idempotent half silently not running must fail too."""
-    _observed_scaffold(monkeypatch, redis_state=({"/docs": 3}, {}, ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "no smoke:abc:user:last_page:* values" in detail
-
-
-def test_observe_reports_a_redis_read_failure(monkeypatch):
-    _observed_scaffold(
-        monkeypatch, redis_state=(None, {}, "could not connect to Redis: refused")
-    )
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "could not connect to Redis" in detail
-
-
-def test_observe_passes_when_both_branches_wrote(monkeypatch):
-    _observed_scaffold(monkeypatch, redis_state=({"/docs": 3}, {"ada": "/docs"}, ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is True
-    assert "1 page counters, 1 last-page values" in detail
-
-
-def test_redis_keys_are_cleared_only_after_the_topology_stops(monkeypatch):
-    """A live consumer would write the keys straight back."""
-    order = []
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: order.append("topic"))
-    monkeypatch.setattr(
-        smoke_test, "_clear_redis_prefix", lambda prefix: order.append("redis")
-    )
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(
-        smoke_test, "_drop_keyspace", lambda keyspace: order.append("cassandra")
-    )
-    monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
-    monkeypatch.setattr(
-        smoke_test, "_stop_topology", lambda p: (order.append("stop"), (True, ""))[1]
-    )
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
-
-    smoke_test.honcho_topology_does_the_work()
-
-    assert order.index("stop") < order.index("redis")
-
-
-def test_the_topology_gets_its_own_redis_prefix(monkeypatch):
-    """Isolation: keys must not collide with a topology already running."""
-    captured = {}
-
-    def capture(*args, **kwargs):
-        captured.update(kwargs.get("env", {}))
-        return FakeHoncho()
-
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
-    monkeypatch.setattr(smoke_test.subprocess, "Popen", capture)
-    monkeypatch.setattr(smoke_test, "_stop_topology", lambda p: (True, ""))
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
-
-    smoke_test.honcho_topology_does_the_work()
-
-    assert captured["REDIS_KEY_PREFIX"].startswith("smoke:")
-    assert captured["REDIS_KEY_PREFIX"].endswith(":")
-
-
-class Row:
-    user_id = "ada"
-    event_time = "2026-09-08"
-    event_id = "e1"
-    page = "/docs"
-
-
-def _cassandra_scaffold(monkeypatch, rows_result):
-    """Drive _observe_topology past Kafka and Redis to the Cassandra assertion."""
-    monkeypatch.setattr(
-        smoke_test, "_group_members", lambda g: ({"a", "b", "c", "d"}, "")
-    )
-    offsets = iter([({0: 1, 1: 1, 2: 1, 3: 1}, ""), ({0: 9, 1: 9, 2: 9, 3: 9}, "")])
-    monkeypatch.setattr(smoke_test, "_group_offsets", lambda g: next(offsets))
-    monkeypatch.setattr(smoke_test, "TOPOLOGY_PROGRESS_SECONDS", 0)
-    monkeypatch.setattr(smoke_test.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(
-        smoke_test, "_redis_state", lambda prefix: ({"/docs": 3}, {"ada": "/docs"}, "")
-    )
-    monkeypatch.setattr(smoke_test, "_cassandra_rows", lambda keyspace: rows_result)
-    monkeypatch.setattr(smoke_test, "_queue_consumers", lambda queue: (4, ""))
-    monkeypatch.setattr(smoke_test, "_job_state", lambda prefix: (7, {"e1": 1}, ""))
-
-
-def test_observe_reports_a_cassandra_read_failure(monkeypatch):
-    _cassandra_scaffold(
-        monkeypatch, rows_result=(None, "could not read keyspace smoke_abc: refused")
-    )
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "could not read keyspace" in detail
-
-
-def test_observe_reports_no_rows_written(monkeypatch):
-    """The durable write silently not happening must fail the check."""
-    _cassandra_scaffold(monkeypatch, rows_result=([], ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "no rows were written to keyspace smoke_abc" in detail
-
-
-@pytest.mark.parametrize("column", ["user_id", "event_time", "event_id", "page"])
-def test_observe_reports_a_missing_key_column(monkeypatch, column):
-    """A row present but unpopulated is not evidence the write works."""
-
-    class Incomplete(Row):
-        pass
-
-    setattr(Incomplete, column, None)
-    _cassandra_scaffold(monkeypatch, rows_result=([Incomplete()], ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert column in detail
-
-
-def test_observe_passes_when_rows_are_complete(monkeypatch):
-    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is True
-    assert "rows in smoke_abc" in detail
-
-
-def test_the_topology_gets_its_own_keyspace(monkeypatch):
-    """Isolation: a topology already running must not satisfy the check."""
-    captured = {}
-
-    def capture(*args, **kwargs):
-        captured.update(kwargs.get("env", {}))
-        return FakeHoncho()
-
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
-    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-    monkeypatch.setattr(smoke_test.subprocess, "Popen", capture)
-    monkeypatch.setattr(smoke_test, "_stop_topology", lambda p: (True, ""))
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
-
-    smoke_test.honcho_topology_does_the_work()
-
-    keyspace = captured["CASSANDRA_KEYSPACE"]
-    assert keyspace.startswith("smoke_")
-    # Must satisfy the identifier rule, since it is interpolated into CQL.
-    from pipeline import cassandra_store
-
-    assert cassandra_store.validate_keyspace(keyspace) == keyspace
-
-
-def test_a_failed_keyspace_creation_fails_the_check(monkeypatch):
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(
-        smoke_test,
-        "_create_keyspace",
-        lambda keyspace: "could not connect to Cassandra",
-    )
-    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
-    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-
-    passed, detail = smoke_test.honcho_topology_does_the_work()
-
-    assert passed is False
-    assert "could not connect to Cassandra" in detail
-
-
-def test_the_keyspace_is_dropped_after_the_topology_stops(monkeypatch):
-    """A live consumer would write into it again."""
-    order = []
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-    monkeypatch.setattr(
-        smoke_test, "_drop_keyspace", lambda keyspace: order.append("drop")
-    )
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
-    monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
-    monkeypatch.setattr(
-        smoke_test, "_stop_topology", lambda p: (order.append("stop"), (True, ""))[1]
-    )
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
-
-    smoke_test.honcho_topology_does_the_work()
-
-    assert order.index("stop") < order.index("drop")
-
-
-def test_observe_reports_the_wrong_number_of_workers(monkeypatch):
-    """Four workers must be consuming the run's own queue."""
-    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
-    monkeypatch.setattr(smoke_test, "_queue_consumers", lambda queue: (2, ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "2 workers were consuming smoke_q" in detail
-
-
-def test_observe_reports_a_rabbitmq_failure(monkeypatch):
-    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
-    monkeypatch.setattr(
-        smoke_test,
-        "_queue_consumers",
-        lambda queue: (None, "could not connect to RabbitMQ"),
-    )
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "could not connect to RabbitMQ" in detail
-
-
-def test_observe_reports_no_completed_jobs(monkeypatch):
-    """Publishing without any worker completing would otherwise pass."""
-    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
-    monkeypatch.setattr(smoke_test, "_job_state", lambda prefix: (0, {}, ""))
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "no jobs completed" in detail
-
-
-def test_observe_reports_a_job_state_failure(monkeypatch):
-    _cassandra_scaffold(monkeypatch, rows_result=([Row()], ""))
-    monkeypatch.setattr(
-        smoke_test, "_job_state", lambda prefix: (None, {}, "reading job state failed")
-    )
-
-    passed, detail = smoke_test._observe_topology(
-        FakeHoncho(), "grp", "topic", "smoke:abc:", "smoke_abc", "smoke_q"
-    )
-
-    assert passed is False
-    assert "reading job state failed" in detail
-
-
-def test_the_topology_gets_its_own_queue(monkeypatch):
-    captured = {}
-
-    def capture(*args, **kwargs):
-        captured.update(kwargs.get("env", {}))
-        return FakeHoncho()
-
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
-    monkeypatch.setattr(smoke_test, "_delete_queue", lambda queue: None)
-    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-    monkeypatch.setattr(smoke_test.subprocess, "Popen", capture)
-    monkeypatch.setattr(smoke_test, "_stop_topology", lambda p: (True, ""))
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
-
-    smoke_test.honcho_topology_does_the_work()
-
-    assert captured["RABBITMQ_QUEUE"].startswith("smoke_jobs_")
-
-
-def test_the_queue_is_deleted_after_the_topology_stops(monkeypatch):
-    order = []
-    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
-    monkeypatch.setattr(smoke_test, "_create_keyspace", lambda keyspace: "")
-    monkeypatch.setattr(smoke_test, "_drop_keyspace", lambda keyspace: None)
-    monkeypatch.setattr(smoke_test, "_delete_topic", lambda name: None)
-    monkeypatch.setattr(smoke_test, "_clear_redis_prefix", lambda prefix: None)
-    monkeypatch.setattr(
-        smoke_test, "_delete_queue", lambda queue: order.append("queue")
-    )
-    monkeypatch.setattr(smoke_test.subprocess, "Popen", lambda *a, **k: FakeHoncho())
-    monkeypatch.setattr(
-        smoke_test, "_stop_topology", lambda p: (order.append("stop"), (True, ""))[1]
-    )
-    monkeypatch.setattr(smoke_test, "_observe_topology", lambda *a: (True, "fine"))
-
-    smoke_test.honcho_topology_does_the_work()
-
-    assert order.index("stop") < order.index("queue")
+    assert ready is True
+    assert "all 4 workers applied worker_delay=0.03" in detail

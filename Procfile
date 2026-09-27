@@ -24,3 +24,8 @@ worker_1: .venv/bin/worker
 worker_2: .venv/bin/worker
 worker_3: .venv/bin/worker
 worker_4: .venv/bin/worker
+# Three coordinators competing for one leadership. Only the winner writes the
+# snapshot, and only while its epoch is still current.
+coordinator_1: .venv/bin/coordinator
+coordinator_2: .venv/bin/coordinator
+coordinator_3: .venv/bin/coordinator

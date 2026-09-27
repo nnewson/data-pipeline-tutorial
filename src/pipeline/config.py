@@ -70,3 +70,18 @@ WORKER_DELAY_SECONDS = float(os.environ.get("WORKER_DELAY_SECONDS", "0.5"))
 # How many unacknowledged messages one worker may hold. 1 spreads work evenly;
 # higher values let a worker reserve a backlog and can reduce fairness.
 WORKER_PREFETCH = int(os.environ.get("WORKER_PREFETCH", "1"))
+
+ZOOKEEPER_HOSTS = os.environ.get("ZOOKEEPER_HOSTS", "localhost:2181")
+
+# Root of this deployment's coordination tree. Overridable so a test run gets a
+# subtree of its own, the way it gets its own topic, group, prefix, keyspace and
+# queue.
+ZOOKEEPER_ROOT = os.environ.get("ZOOKEEPER_ROOT", "/pipeline")
+
+# Requested session timeout. The server clamps this against its own limits and
+# decides expiry, so the negotiated value is what actually governs timing —
+# always read it back rather than assuming this number.
+ZOOKEEPER_TIMEOUT_SECONDS = float(os.environ.get("ZOOKEEPER_TIMEOUT_SECONDS", "10"))
+
+# How often the leader writes a snapshot.
+SNAPSHOT_INTERVAL_SECONDS = float(os.environ.get("SNAPSHOT_INTERVAL_SECONDS", "2"))

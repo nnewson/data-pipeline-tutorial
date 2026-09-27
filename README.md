@@ -4,17 +4,18 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.6 — RabbitMQ.** The consumers now publish a job per event, and
-four workers compete for one queue. A replay stops being about stored values and
-starts being about work that runs twice — and there are now two different ways a
-job can repeat, which look nothing alike.
+**This release: 0.7 — ZooKeeper.** Three coordinators compete for one
+leadership, and the winner alone writes a snapshot of the pipeline. The
+delivery-semantics thread so far has been about a *message* arriving twice; this
+one is about a **role** being held twice — and the fix is not a better election but a fencing token that
+lets the write itself refuse the loser.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.6
+git checkout 0.7
 ```
 
 ## Prerequisites
@@ -41,18 +42,26 @@ the broker, so a topic's partition count is a decision rather than an accident:
 ```bash
 uv run create-topics
 uv run create-schema
+uv run cluster init
 ```
 
 ```text
 INFO pipeline: Created topic pageviews with 4 partition(s)
 INFO schema: Applied cassandra_schema.cql to keyspace pipeline
+INFO coordination: Coordination tree ready under /pipeline
 ```
+
+Three commands, one per thing that has to exist before anything runs. Each is the
+*only* path that creates its own persistent state, and everything else waits for
+it rather than inventing its own — the same rule for topics, the Cassandra
+keyspace and the ZooKeeper tree.
 
 Cassandra takes 40–90 seconds to accept connections on a first start, so
 `docker compose up -d --wait` will sit there for a while before returning. It
 has not hung.
 
-Then start everything — a producer, four consumers, and four workers:
+Then start everything — a producer, four consumers, four workers, and three
+coordinators:
 
 ```bash
 uv run honcho start
@@ -473,6 +482,260 @@ effect. A worker dying between the Redis update and its acknowledgement will run
 the work again *and* count it again. That is evidence for the lesson rather than
 noise — but it does mean the number is not ground truth.
 
+## One leadership, three contenders
+
+Three coordinators run; one leads. The leader alone writes a snapshot of the
+pipeline every couple of seconds, which 0.8 will serve over HTTP.
+
+```bash
+uv run cluster status
+```
+
+```text
+  leader      Nicks-MacBook-Pro.local-14101
+  epoch       1
+  contenders  3
+  coordinators 3
+  consumers   4
+  workers     4
+    config versions applied: [0]
+  worker_delay 0.5 (version 0)
+  snapshot    version 8: {"epoch": 1, "pageviews": 133, "jobs_completed": 108, ...}
+```
+
+Three contenders, one acknowledged leader. Run it before starting the topology and
+every count is zero with no leader — the tree exists but nothing is participating
+in it.
+
+**None of this is Kafka's metadata.** Kafka has run KRaft since 0.2 and keeps its
+own; nothing here touches it. This is application coordination — which is what
+most people who deploy ZooKeeper actually deploy it for, and the thing the
+tutorial could not show while ZooKeeper was hiding inside Kafka's setup.
+
+Four znodes do four different jobs, and conflating them is the usual mistake:
+
+```text
+/election/<seq>   one ephemeral sequential node per contender. Counting these
+                  counts candidates, not leaders.
+/leader           the acknowledged winner, written once it knows it has won.
+                  Ephemeral, so a dead leader does not keep the role on paper.
+/epoch            persistent fencing state. Outlives every leadership change.
+/snapshot         the fenced result of leader-only work.
+```
+
+The standard recipe gives the lowest sequence number the leadership, and Apache's
+own recipe notes that being lowest does not prove a process *knows* it has won.
+So the acknowledgement is separate: `/leader` is written by the winner, and
+`cluster status` reads that rather than counting `/election` children.
+
+## Sessions are not connections
+
+This is the distinction the whole release turns on, and code that misses it is
+subtly wrong rather than obviously broken.
+
+A ZooKeeper client that loses its **connection** has not lost its **session**. It
+has until the session timeout to reconnect, and its ephemeral nodes survive in
+the meantime. kazoo reports three states:
+
+| state | what it means | what a leader must do |
+|---|---|---|
+| `CONNECTED` | normal | work |
+| `SUSPENDED` | connection lost, session may survive | **stop** — leadership is *unknown* |
+| `LOST` | session gone, ephemeral nodes deleted | stop, void the epoch, re-enter the election |
+
+Code that handles only `LOST` keeps doing leader work right through a partition,
+which is exactly how two processes end up believing they lead at once.
+
+The same distinction appears in the error paths, and getting it wrong here was a
+real bug in this release's development. A write failing with `ConnectionLoss` is
+*not* a session expiry: ending the tenure there would re-enter the election while
+our own still-live `/leader` marker sat in the way, and every later winner would
+then fail to acquire it. So `ConnectionLoss` pauses and retries;
+`SessionExpiredError` ends the tenure.
+
+One kazoo detail with teeth: cancelling an elected contender **does not interrupt
+the function it is running**. The state listener therefore signals a cooperative
+loop that checks a flag — it cannot assume the recipe will stop anything.
+
+## Fencing: why electing a leader is not enough
+
+A leadership claim is tied to a session. If that session expires — a long GC
+pause, a partition, a slow disk — ZooKeeper elects someone else, and **the old
+leader is not told synchronously**. For a while, two processes believe they hold
+the role.
+
+Election alone is therefore an *agreement with a lease*, not mutual exclusion.
+What makes it safe is a **fencing token** the write itself can check:
+
+```python
+epoch = claim_epoch(client, paths)  # CAS on /epoch; keep the version
+
+transaction = client.transaction()
+transaction.check(paths.epoch, version=epoch)  # still current?
+transaction.set_data(paths.snapshot, payload)
+```
+
+The moment another leader claims, `/epoch` advances and every transaction
+carrying the old version fails. A deposed leader cannot write, whatever it
+believes about itself.
+
+Two details that matter more than they look:
+
+- **kazoo's `commit()` returns a list of results** rather than raising for every
+  failure, so each result is inspected. Only a `BadVersionError` from the epoch
+  check means "superseded"; anything else is a genuine failure and is raised.
+- **A rejected write must leave the snapshot untouched** — value *and* version. A
+  fence that rejects but still mutates is not a fence.
+
+And the reason for a single writer, stated accurately. Four coordinators all
+writing snapshots would be *wasteful* and would race to overwrite each other —
+that is an efficiency argument. What makes the snapshot **correct** is the fenced
+write. Do not let the first claim do the second's work.
+
+## Watching two leaders happen
+
+```bash
+uv run failover-demo
+```
+
+**Stop the Honcho topology first**, and make sure the full setup above is done —
+`docker compose up`, `create-topics`, `create-schema` and `cluster init`. The demo
+starts three coordinators of its own and waits for one of *them* to win; leaving
+the topology running means its coordinators compete in the same election, and the
+demo times out waiting for a leader it recognises. It waits for the coordination
+tree rather than creating one, so `cluster init` is a prerequisite rather than
+something it does for you.
+
+It is **not** part of the routine smoke test, because it waits through a session
+expiry and that would be dead time on every CI run.
+
+It makes two observations, deliberately separate:
+
+```text
+  leader A: …-99668 at epoch 1
+  SIGSTOP 99668 — frozen, not killed
+  leader B: …-99670 at epoch 2
+
+  --- the split ---
+  ZooKeeper says the leader is   …-99670
+  A's own log still says it is    the leader
+  Two processes, two beliefs, no race required.
+
+  SIGCONT 99668 — letting A find out
+  A has learned its session was lost
+
+  --- the fence ---
+  the snapshot now belongs to B, at epoch 2
+  submitting a snapshot with A's epoch token 1
+  REJECTED: epoch version 1 is no longer current
+  snapshot still belongs to epoch 2
+```
+
+Why two rather than one: a **stopped process cannot write anything**, so freezing
+a leader proves stale *belief* but never a stale *write*. And after `SIGCONT` a
+correct client may process `LOST` before its loop runs again, so trying to catch
+the write in flight would be racing the scheduler. The fence is therefore tested
+directly instead, by submitting the deposed leader's epoch by hand.
+
+Every line above is an acceptance condition — the script exits non-zero rather
+than printing its punchline regardless. `SIGCONT` is issued before any teardown
+even when a condition fails partway, because a stopped process is invisible to a
+process count and still holds its session.
+
+## Registration is session membership, not liveness
+
+Consumers, workers and coordinators each register an ephemeral sequential node,
+so the tree shows what is participating without anyone maintaining a list, and
+cleans itself up when a session ends.
+
+Say precisely what that buys:
+
+> the tree shows which **sessions currently hold registrations**
+
+Not "what is alive". A wedged or `SIGSTOP`ped process stays registered until its
+session expires — as the failover demonstration shows on purpose. Presence and
+liveness are different questions and ZooKeeper answers only the first.
+
+Registration is part of **startup**, not an optional extra: a process refuses to
+start without it, because one doing work while absent from the registry makes the
+tree under-report exactly when something is wrong. After startup it is
+survivable — a session loss is retried in the background while the data path
+keeps running. ZooKeeper is required for coordinated startup and observable
+membership, not for consumer or worker availability afterwards.
+
+## Configuration that changes without a restart
+
+`WORKER_DELAY_SECONDS` lives in a znode. Change it and all four workers pick it
+up on their next job:
+
+```bash
+uv run cluster set-config --worker-delay 0.05
+uv run cluster status
+```
+
+```text
+  workers     4
+    config versions applied: [1]
+  worker_delay 0.05 (version 1)
+```
+
+All four report the same version, which is the point — see below.
+
+**Nothing in this project was live before 0.7**, and pretending otherwise would
+have produced a demonstration that worked only because the process restarted.
+Settings were read once at import and captured as default arguments:
+
+```python
+def handle_job(..., delay: float = WORKER_DELAY_SECONDS) -> None:   # captured at def time
+```
+
+So this release introduces a small thread-safe config object that a worker reads
+as it *begins* a job. Three details earn their place:
+
+- **Validate at both ends.** `cluster set-config` checks the value, but anyone can
+  write the znode with `zkCli`, so each worker validates independently and keeps
+  its last known-good setting if validation fails. A worker also refuses to
+  start if no value could be applied at all.
+- **Watches are one-shot.** A data watch fires once and must be re-registered,
+  and a change can land in between — which is why the refresh re-reads current
+  state rather than trusting the event to carry a value. kazoo's `DataWatch` hides
+  this; the code here does it by hand, because the mechanism is the lesson.
+  (Modern ZooKeeper also offers persistent watches.)
+- **Prove it applied.** Each worker reports the applied config *version* in its
+  registration, so a check can require all four to report the same version.
+  Aggregate throughput would not prove that — it is consistent with one worker
+  having noticed.
+
+## What the leader records
+
+```json
+{"epoch": 1, "at": 1790514951.09, "pageviews": 133, "pages": 4,
+ "jobs_completed": 108, "jobs_distinct": 108, "queue_waiting": 0,
+ "queue_consumers": 4, "cassandra_reachable": true, "kafka_committed": 131}
+```
+
+A snapshot is a design decision about what is cheap enough to read on a timer.
+Cassandra contributes **reachability**, not a row count: 0.5 documented
+`COUNT(*)` as a diagnostic that scans every partition, and putting it on a timer
+would turn that warning into an application access pattern. RabbitMQ's
+*unacknowledged* count is absent because a passive AMQP declare does not expose
+it, and adding the management HTTP API for one number is not worth a second
+client.
+
+Redis, Cassandra and Kafka are read through connections held for the life of the
+process rather than rebuilt per snapshot. Building a Cassandra cluster or a Kafka
+admin client every two seconds costs far more than the query, and during an
+outage the retry path would block the leader loop for longer than the interval
+itself.
+
+RabbitMQ is the exception: `queue_state()` opens and closes an AMQP connection on
+each call. It is honest to say so rather than claim a uniformity the code does not
+have — and it is the obvious next thing to fix if the snapshot interval ever gets
+short enough for it to matter.
+
+0.8 serves this snapshot over HTTP — which is why the leader exists at all rather
+than merely recording that it is the leader.
+
 ## Derived state, and rebuilding it
 
 Redis runs with persistence off:
@@ -493,10 +756,21 @@ Three services, three answers to "what survives being replaced":
 | Redis | a deliberately volatile materialized view | no |
 | Cassandra | a durable, query-oriented materialized view | yes |
 | RabbitMQ | durable work awaiting completion | yes, but only while unacknowledged |
+| ZooKeeper | coordination state | persistent znodes survive; **ephemeral ones die with their session**, which is the point of them |
 
 Cassandra is still *derived* from the Kafka log — everything in it can be
 rebuilt by the same replay that rebuilds Redis. Its volume changes how durable
 and how queryable the view is, not where the truth lives.
+
+ZooKeeper needs two named volumes rather than one: the official image keeps
+snapshots in `/data` and the transaction log in `/datalog`. Its ephemeral nodes
+are *not* meant to survive — dying with their session is what makes them useful
+for membership and leadership.
+
+This is a single-node ZooKeeper, deliberately. It demonstrates client
+coordination semantics — sessions, watches, ephemeral ownership, fencing — and
+says nothing about the availability of a replicated ensemble, which is a separate
+subject with its own failure modes.
 
 RabbitMQ needs all three parts to be durable: a durable queue, persistent
 messages, and a broker volume — **plus a fixed hostname**. Its data directory is
@@ -604,7 +878,9 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
 
 RabbitMQ follows the same pattern: `localhost:5672` from the host,
 `rabbitmq:5672` from inside the network, with the management UI published
-separately at [localhost:15672](http://localhost:15672).
+separately at [localhost:15672](http://localhost:15672). ZooKeeper is
+`localhost:2181` and `zookeeper:2181` — the last new service before Flink brings
+a jobmanager and taskmanager of its own at 0.10.
 
 It also needs a real user, which the others do not. RabbitMQ's built-in `guest`
 account may only connect over the broker's own loopback interface, so a client
@@ -620,8 +896,10 @@ Kafka 4.x runs KRaft only: ZooKeeper mode was deprecated in 3.5 and removed in
 development and explicitly not a production topology, where controllers are
 separate nodes.
 
-ZooKeeper still appears in this tutorial, at 0.7 — coordinating the pipeline's
-own processes, which is a different job from storing Kafka's metadata.
+ZooKeeper appears in this tutorial at 0.7 — coordinating the pipeline's own
+processes, which is a different job from storing Kafka's metadata. That
+separation is the point: a reader meets ZooKeeper as a coordination primitive
+they chose, not as infrastructure another service dragged in.
 
 ## Testing
 
@@ -646,9 +924,9 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers owned 4 partitions of smoke_topology_8f3413ef, committed offsets advanced 113 to 339, 4 page counters, 346 last-page values, rows in smoke_8f3413ef, and 347 job(s) across 347 event(s) completed by 4 workers, and nothing was left running
+PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 137 to 239; 4 counters, 246 last-page values; rows written to smoke_bc837f27; 4 workers, 247 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; leader …-99608 wrote again at epoch 1 (snapshot v27 -> v28); all 4 workers applied worker_delay=0.03 at config version 1; nothing was left running
 
-all 4 checks passed in 23.1s
+all 4 checks passed in 18.2s
 ```
 
 On a brand new cluster you will also see `NotCoordinatorError` once or twice
@@ -661,18 +939,32 @@ own four partitions, confirms committed offsets advance, and stops it again. The
 other three build their own clients, so they would all pass with a broken
 Procfile.
 
-It runs against a topic, consumer group, Redis key prefix, Cassandra keyspace
-and RabbitMQ queue created for that run alone, all handed to Honcho through the
-environment. Sharing `pageviews` and the `pipeline` group
+It runs against a topic, consumer group, Redis key prefix, Cassandra keyspace,
+RabbitMQ queue and ZooKeeper root created for that run alone, all handed to
+Honcho through the environment. Sharing `pageviews` and the `pipeline` group
 would let a topology you happen to have running satisfy the check — and a live
 `honcho` process is not evidence that the members being observed are its own.
-It asserts both Redis branches, that rows reached Cassandra with their key
-columns populated, that exactly four workers were consuming the run's queue, and
-that jobs actually completed — so the release cannot ship with any of its writes
-silently not happening. Publishing without a worker completing anything would
-otherwise pass. Everything it created for the run — Redis keys, Cassandra
-keyspace, RabbitMQ queue and Kafka topic — is removed only after the topology
-has stopped, or a live consumer or worker would write straight back into it.
+Readiness is a list of predicates rather than a fixed sequence, because the
+topology now has a *state* and not merely a process count. All of these must
+hold, under one shared deadline:
+
+- four Kafka group members owning four partitions, with committed offsets
+  advancing;
+- both Redis branches written, counters *and* last-page values;
+- Cassandra rows present with their key columns populated;
+- exactly four workers consuming the run's queue, and jobs completed;
+- exactly one acknowledged leader among three contenders, three coordinator
+  registrations, four consumers and four workers — and the leader must be one of
+  the registered coordinators, not a marker written by a process that vanished;
+- a second snapshot from the *same* leader at the *same* epoch, with an advanced
+  version, because reading one znode twice is not two snapshots;
+- a published worker delay reaching all four workers at the exact znode version.
+
+That last one matters: without it the check would pass with the whole watch path
+broken, because the workers would keep their startup values and nothing would
+say so. Everything it created for the run — Redis keys, Cassandra keyspace, RabbitMQ
+queue, ZooKeeper subtree and Kafka topic — is removed only after the topology has
+stopped, or a live consumer or worker would write straight back into it.
 
 CI runs these as two jobs. `quality` covers linting, formatting, unit tests and
 Compose parsing; `integration` starts the real topology and runs the smoke test.
@@ -683,7 +975,7 @@ published only after both tag workflows pass.
 ## Project structure
 
 ```text
-docker-compose.yml       Kafka in KRaft mode, Redis, Cassandra, and RabbitMQ
+docker-compose.yml       Kafka (KRaft), Redis, Cassandra, RabbitMQ, ZooKeeper
 cassandra_schema.cql     the keyspace and table, applied by create-schema
 src/pipeline/
     __init__.py          logging setup and connection retry
@@ -699,6 +991,13 @@ src/pipeline/
     jobs_queue.py        one queue declaration, used by publisher and workers
     worker.py            competes for the queue, does slow work, acknowledges
     jobs.py              queue depth and completed executions
+    coordination.py      election, fencing, registration, watches
+    kafka_offsets.py     committed offsets, through one retained admin client
+    coordinator.py       contends for leadership; the winner writes snapshots
+    cluster.py           creates the coordination tree, and inspects it
+    runtime_config.py    settings that can change while a process runs
+    failover_demo.py     the two-leaders demonstration
+    topology_runner.py   starts, observes and stops the whole topology
     smoke_test.py        bounded assertions against a running broker
 tests/
 Procfile                 the processes that make up the running system

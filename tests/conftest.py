@@ -12,6 +12,7 @@ import pytest
 
 from pipeline import (
     cassandra_store,
+    coordination,
     jobs_queue,
     kafka_consumer,
     producer,
@@ -38,6 +39,7 @@ CONNECTING_MODULES = (
     jobs_queue,
     producer,
     kafka_consumer,
+    coordination,
 )
 
 
@@ -78,3 +80,117 @@ def no_real_connections(request, monkeypatch):
 
     # Kafka clients are constructed directly rather than through the helper, so
     # the guard cannot reach them; those call sites are stubbed per test.
+
+
+# --- shared ZooKeeper double -------------------------------------------------
+#
+# Lives here rather than in one test module because `tests` is not a package,
+# so modules cannot import from each other.
+
+from kazoo.exceptions import BadVersionError, NodeExistsError, NoNodeError  # noqa: E402
+
+
+class FakeStat:
+    def __init__(self, version=0):
+        self.version = version
+
+
+class FakeClient:
+    """Enough ZooKeeper to exercise the logic, with failures on demand."""
+
+    def __init__(self):
+        self.data: dict[str, bytes] = {}
+        self.versions: dict[str, int] = {}
+        self.ephemeral: set[str] = set()
+        self.deleted: list[str] = []
+        self.created: list[str] = []
+        self.set_calls: list[str] = []
+        self.fail_next_get: Exception | None = None
+
+    def ensure_path(self, path):
+        self.data.setdefault(path, b"")
+        self.versions.setdefault(path, 0)
+
+    def exists(self, path):
+        return path in self.data
+
+    def create(self, path, value=b"", ephemeral=False, sequence=False):
+        if sequence:
+            path = f"{path}{len(self.created):010d}"
+        if path in self.data:
+            raise NodeExistsError(path)
+        self.data[path] = value
+        self.versions[path] = 0
+        self.created.append(path)
+        if ephemeral:
+            self.ephemeral.add(path)
+        return path
+
+    def get(self, path, watch=None):
+        if self.fail_next_get is not None:
+            error, self.fail_next_get = self.fail_next_get, None
+            raise error
+        if path not in self.data:
+            raise NoNodeError(path)
+        return self.data[path], FakeStat(self.versions[path])
+
+    def set(self, path, value, version=-1):
+        self.set_calls.append(path)
+        if path not in self.data:
+            raise NoNodeError(path)
+        if version != -1 and version != self.versions[path]:
+            raise BadVersionError(path)
+        self.data[path] = value
+        self.versions[path] += 1
+        return FakeStat(self.versions[path])
+
+    def delete(self, path, recursive=False, version=-1):
+        if version != -1 and self.versions.get(path) != version:
+            # Honoured, so the read/delete replacement race is actually tested
+            # rather than only the different-identity case.
+            raise BadVersionError(path)
+        self.deleted.append(path)
+        self.data.pop(path, None)
+        self.versions.pop(path, None)
+        self.ephemeral.discard(path)
+
+    def get_children(self, path):
+        prefix = f"{path}/"
+        return [k[len(prefix) :] for k in self.data if k.startswith(prefix)]
+
+    def transaction(self):
+        return FakeTransaction(self)
+
+
+class FakeTransaction:
+    def __init__(self, client):
+        self._client = client
+        self._checks = []
+        self._sets = []
+
+    def check(self, path, version):
+        self._checks.append((path, version))
+
+    def set_data(self, path, value):
+        self._sets.append((path, value))
+
+    def commit(self):
+        for path, version in self._checks:
+            if self._client.versions.get(path) != version:
+                # kazoo returns results; it does not raise for every failure.
+                return [BadVersionError(path), RuntimeError("rolled back")]
+        for path, value in self._sets:
+            self._client.data[path] = value
+            self._client.versions[path] += 1
+        return [True for _ in self._checks + self._sets]
+
+
+@pytest.fixture
+def zookeeper():
+    """A fake ZooKeeper with the pipeline's tree already initialised."""
+    from pipeline import coordination
+
+    client = FakeClient()
+    paths = coordination.Paths(root="/t")
+    coordination.initialise(client, paths, worker_delay=0.5)
+    return client, paths

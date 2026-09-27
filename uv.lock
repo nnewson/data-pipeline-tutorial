@@ -39,12 +39,13 @@ wheels = [
 
 [[package]]
 name = "data-pipeline-tutorial"
-version = "0.6"
+version = "0.7"
 source = { editable = "." }
 dependencies = [
     { name = "cassandra-driver" },
     { name = "faker" },
     { name = "kafka-python" },
+    { name = "kazoo" },
     { name = "pika" },
     { name = "redis" },
 ]
@@ -62,6 +63,7 @@ requires-dist = [
     { name = "faker" },
     { name = "honcho", marker = "extra == 'dev'" },
     { name = "kafka-python" },
+    { name = "kazoo" },
     { name = "pika" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "redis" },
@@ -133,6 +135,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d5/6a/8a3bfb819b5350652dfa5365409b7c611eed8ae0b37c84f53d0a26ae9513/kafka_python-3.0.11.tar.gz", hash = "sha256:a003d927e79c801d6cfd1e59ceaaf78807351e75cdb5b8ee9ce4262586f9780f", size = 514717, upload-time = "2026-08-16T16:46:15.481Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/9a/191343fd96564cbbed51bd33a53c08144e1ce285e2f10fb1578899e86c28/kafka_python-3.0.11-py3-none-any.whl", hash = "sha256:9d10cab4e11e02545d82c7e5af5702da5aa46dd4eccd11ad92a50bf6dbbecd14", size = 614237, upload-time = "2026-08-16T16:46:13.54Z" },
+]
+
+[[package]]
+name = "kazoo"
+version = "2.11.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/07/2cdc0daaa2199fecaee28ee9051afedeccb46c818b2c47fc32b7383905d5/kazoo-2.11.0.tar.gz", hash = "sha256:57e7e6f69295c8f922511488eeb79680729e14bb8eb382d5cad83aa11345c36c", size = 186460, upload-time = "2026-03-21T19:08:53.702Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/b9/5328ff14f7d637ac90f7144d4aad27b17bdd063325c9fb4b88c4e1f109fe/kazoo-2.11.0-py2.py3-none-any.whl", hash = "sha256:aa6be17159540dae4087661b8d4e24c7b58d4dc26170a2d5b8468b06712d84a9", size = 150943, upload-time = "2026-03-21T19:08:52.575Z" },
 ]
 
 [[package]]

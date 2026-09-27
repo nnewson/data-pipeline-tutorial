@@ -8,7 +8,6 @@ stays a caller and the success criteria stay reviewable code.
 import json
 import logging
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -20,6 +19,7 @@ from kafka.errors import KafkaError
 
 from pipeline import (
     cassandra_store,
+    coordination,
     ensure_topic,
     get_partition,
     jobs_queue,
@@ -28,11 +28,20 @@ from pipeline import (
 )
 from pipeline.config import KAFKA_PARTITIONS, KAFKA_SERVER
 from pipeline.schema import SCHEMA_FILE
+from pipeline.topology_runner import (
+    COMMAND_TIMEOUT_SECONDS,
+    Topology,
+)
 
 # Every check is bounded, so a broken topology fails rather than hangs.
+# The Procfile runs three coordinators competing for one leadership.
+COORDINATORS = 3
+
+# Long enough for a watch to fire and four workers to re-register.
+LIVE_CONFIG_TIMEOUT_SECONDS = 30
+
 CONSUME_TIMEOUT_MS = 30_000
 PRODUCE_TIMEOUT_SECONDS = 30
-COMMAND_TIMEOUT_SECONDS = 120
 
 logger = logging.getLogger("smoke-test")
 
@@ -208,7 +217,6 @@ def routing_uses_every_partition() -> tuple[bool, str]:
 
 TOPOLOGY_SETTLE_SECONDS = 60
 TOPOLOGY_PROGRESS_SECONDS = 10
-HONCHO_STOP_TIMEOUT_SECONDS = 30
 
 
 def _delete_topic(name: str) -> None:
@@ -298,139 +306,6 @@ def _group_offsets(group: str) -> tuple[dict[int, int] | None, str]:
         except ValueError:
             continue
     return offsets, ""
-
-
-def _process_table() -> tuple[dict[int, tuple[int, int]], str]:
-    """Every process as pid -> (ppid, pgid), or a reason it is unavailable."""
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,pgid="],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=COMMAND_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        return {}, "ps is not available on PATH"
-    except subprocess.TimeoutExpired:
-        return {}, "listing processes timed out"
-
-    if result.returncode != 0:
-        return {}, f"listing processes failed: {result.stderr.strip()}"
-
-    table: dict[int, tuple[int, int]] = {}
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) != 3:
-            continue
-        try:
-            table[int(fields[0])] = (int(fields[1]), int(fields[2]))
-        except ValueError:
-            continue
-    return table, ""
-
-
-def _topology_groups(pid: int) -> tuple[set[int], str]:
-    """Process groups belonging to a process and everything below it.
-
-    Honcho puts each Procfile process in a group of its own, so its own group is
-    not enough to describe the topology. Taken before shutdown, while the parent
-    links still exist: afterwards the children are reparented to init.
-    """
-    table, error = _process_table()
-    if error:
-        return set(), error
-
-    if pid not in table:
-        # Honcho exited between observation and snapshot. Its children may have
-        # been reparented and still be running, and there is no longer a link to
-        # find them by, so this cannot be reported as "nothing was running".
-        return set(), f"honcho pid {pid} was absent; shutdown cannot be verified"
-
-    children: dict[int, list[int]] = {}
-    for child, (parent, _) in table.items():
-        children.setdefault(parent, []).append(child)
-
-    groups: set[int] = {table[pid][1]}
-
-    pending = [pid]
-    while pending:
-        for child in children.get(pending.pop(), []):
-            groups.add(table[child][1])
-            pending.append(child)
-    return groups, ""
-
-
-def _process_group_is_empty(pgid: int) -> bool:
-    """Whether any process remains in the group.
-
-    Signal 0 asks about the group without touching it. Nothing here ever sends a
-    real signal to a captured group, so a recycled PGID can only cause a false
-    failure, never a false pass.
-    """
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    return False
-
-
-def _stop_topology(process: subprocess.Popen) -> tuple[bool, str]:
-    """Stop the topology, then assert that nothing it started is still running.
-
-    Shutdown itself works because Honcho forwards termination to the process
-    groups it manages — the workers are not members of Honcho's own group. The
-    group check afterwards is a regression assertion rather than part of the
-    mechanism: it fails if a future change (reintroducing `uv run`, or another
-    launcher that starts processes in their own sessions) leaves work running
-    after Honcho exits.
-    """
-    groups, snapshot_error = _topology_groups(process.pid)
-
-    # Shut down whether or not the snapshot succeeded.
-    try:
-        honcho_group = os.getpgid(process.pid)
-    except ProcessLookupError:
-        honcho_group = None
-
-    if honcho_group is not None:
-        try:
-            os.killpg(honcho_group, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    # Reap the direct child: an unreaped zombie still occupies its PID, so its
-    # group would look occupied by a process that has already exited.
-    try:
-        process.wait(timeout=HONCHO_STOP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        if honcho_group is not None:
-            try:
-                os.killpg(honcho_group, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-        try:
-            process.wait(timeout=HONCHO_STOP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
-
-    if snapshot_error:
-        return False, snapshot_error
-
-    # Termination is not instant, so give the groups a moment to drain.
-    deadline = time.monotonic() + HONCHO_STOP_TIMEOUT_SECONDS
-    survivors: list[int] = []
-    while time.monotonic() < deadline:
-        survivors = [
-            group for group in sorted(groups) if not _process_group_is_empty(group)
-        ]
-        if not survivors:
-            return True, ""
-        time.sleep(0.5)
-
-    return False, f"process groups still running after shutdown: {survivors}"
 
 
 def _clear_redis_prefix(prefix: str) -> None:
@@ -570,202 +445,372 @@ def _job_state(prefix: str) -> tuple[int | None, dict[str, int], str]:
     return completed, runs, ""
 
 
-def _observe_topology(
-    honcho: subprocess.Popen,
-    group: str,
-    topic: str,
-    prefix: str,
-    keyspace: str,
-    queue: str,
-) -> tuple[bool, str]:
-    """Watch a running topology settle and make progress."""
-    deadline = time.monotonic() + TOPOLOGY_SETTLE_SECONDS
-    members: set[str] = set()
-    offsets: dict[int, int] = {}
-    while time.monotonic() < deadline:
-        if honcho.poll() is not None:
-            return False, f"honcho exited early with code {honcho.returncode}"
+def _leader_state(root: str) -> tuple[dict | None, str]:
+    """The acknowledged leader, or why it cannot be read."""
+    try:
+        client = coordination.connect()
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, f"could not connect to ZooKeeper: {error}"
+    try:
+        return coordination.read_leader(client, coordination.Paths(root=root)), ""
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, f"reading leadership failed: {error}"
+    finally:
+        client.stop()
+        client.close()
 
-        members_or_none, error = _group_members(group)
-        if members_or_none is None:
-            return False, error
-        offsets_or_none, error = _group_offsets(group)
-        if offsets_or_none is None:
-            return False, error
 
-        members, offsets = members_or_none, offsets_or_none
-        if len(members) == KAFKA_PARTITIONS and len(offsets) == KAFKA_PARTITIONS:
-            break
-        time.sleep(2)
-    else:
-        return False, (
-            f"topology did not settle: {len(members)} members owning "
-            f"{len(offsets)} partitions, wanted {KAFKA_PARTITIONS} of each"
-        )
+def _coordination_state(root: str) -> tuple[dict | None, str]:
+    """Leader, contenders, registrations and snapshot, in one connection."""
+    paths = coordination.Paths(root=root)
+    try:
+        client = coordination.connect()
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, f"could not connect to ZooKeeper: {error}"
+    try:
+        snapshot, version = coordination.read_snapshot(client, paths)
+        return {
+            "leader": coordination.read_leader(client, paths),
+            "contenders": len(client.get_children(paths.election))
+            if client.exists(paths.election)
+            else 0,
+            "workers": coordination.registrations(client, paths, "worker"),
+            "consumers": coordination.registrations(client, paths, "consumer"),
+            "coordinators": coordination.registrations(client, paths, "coordinator"),
+            "snapshot": snapshot,
+            "snapshot_version": version,
+        }, ""
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, f"reading coordination state failed: {error}"
+    finally:
+        client.stop()
+        client.close()
 
-    before = sum(offsets.values())
-    time.sleep(TOPOLOGY_PROGRESS_SECONDS)
 
-    later_members, error = _group_members(group)
-    if later_members is None:
-        return False, error
-    if len(later_members) != KAFKA_PARTITIONS:
-        return False, (
-            f"group ended with {len(later_members)} members, "
-            f"expected exactly {KAFKA_PARTITIONS}"
-        )
-
-    after_offsets, error = _group_offsets(group)
-    if after_offsets is None:
-        return False, error
-    after = sum(after_offsets.values())
-    if after <= before:
-        return False, (
-            f"committed offsets did not advance ({before} then {after}); "
-            "the producer or the consumers are not doing their job"
-        )
-
-    counts, pages, error = _redis_state(prefix)
-    if counts is None:
-        return False, error
-
-    # Both branches of the release, not just the counter: asserting only the
-    # INCR would let the idempotent half ship broken.
-    if not counts:
-        return False, f"no {prefix}pageviews:* counters were written"
-    if not pages:
-        return False, f"no {prefix}user:last_page:* values were written"
-
-    consumers, error = _queue_consumers(queue)
-    if consumers is None:
-        return False, error
-    if consumers != KAFKA_PARTITIONS:
-        return False, (
-            f"{consumers} workers were consuming {queue}, expected {KAFKA_PARTITIONS}"
-        )
-
-    completed, runs, error = _job_state(prefix)
-    if completed is None:
-        return False, error
-    if completed < 1:
-        return False, f"no jobs completed under {prefix}"
-
-    rows, error = _cassandra_rows(keyspace)
-    if rows is None:
-        return False, error
-    if not rows:
-        return False, f"no rows were written to keyspace {keyspace}"
-    missing = [
-        column
-        for column in ("user_id", "event_time", "event_id", "page")
-        if getattr(rows[0], column, None) in (None, "")
-    ]
-    if missing:
-        return False, f"rows in {keyspace} are missing {missing}"
-
-    return True, (
-        f"{len(members)} consumers owned {len(offsets)} partitions of {topic}, "
-        f"committed offsets advanced {before} to {after}, "
-        # Reported as two independent facts: they are read at different
-        # instants while the topology is still running, so their totals are not
-        # expected to agree.
-        f"{len(counts)} page counters, {len(pages)} last-page values, "
-        f"rows in {keyspace}, and {completed} job(s) across {len(runs)} "
-        f"event(s) completed by {consumers} workers"
-    )
+def _delete_zookeeper_root(root: str) -> None:
+    """Remove a run's subtree. Best effort: never fail the check on cleanup."""
+    try:
+        client = coordination.connect()
+    except Exception as error:  # noqa: BLE001 - cleanup is best effort
+        logger.warning(f"could not connect to delete {root}: {error}")
+        return
+    try:
+        if client.exists(root):
+            client.delete(root, recursive=True)
+    except Exception as error:  # noqa: BLE001 - cleanup is best effort
+        logger.warning(f"could not delete {root}: {error}")
+    finally:
+        client.stop()
+        client.close()
 
 
 def honcho_topology_does_the_work() -> tuple[bool, str]:
-    """Run the real Procfile topology and assert it processes events.
+    """Run the real Procfile topology and assert it does its job.
 
-    Isolated deliberately: its own topic and its own consumer group, both handed
-    to Honcho through the environment. Sharing `pageviews` and the `pipeline`
-    group would let a topology someone left running satisfy this check, and a
-    live honcho process is not evidence that the members observed are its own.
+    Isolated deliberately: its own topic, consumer group, Redis prefix,
+    Cassandra keyspace, RabbitMQ queue and ZooKeeper root, all handed to Honcho
+    through the environment. Sharing any of them would let a topology someone
+    left running satisfy this check.
+
+    Readiness is a list of predicates rather than a fixed sequence, because at
+    0.7 the topology has a *state* — exactly one acknowledged leader — and not
+    merely a process count.
     """
     run_id = uuid.uuid4().hex[:8]
     topic = f"smoke_topology_{run_id}"
     group = f"smoke-topology-{run_id}"
     prefix = f"smoke:{run_id}:"
-    # Lowercase and underscore only: CQL folds unquoted identifiers.
     keyspace = f"smoke_{run_id}"
     queue = f"smoke_jobs_{run_id}"
-    honcho: subprocess.Popen | None = None
+    root = f"/smoke_{run_id}"
+
+    topology = Topology(
+        os.environ
+        | {
+            "KAFKA_TOPIC": topic,
+            "CONSUMER_GROUP": group,
+            "REDIS_KEY_PREFIX": prefix,
+            "CASSANDRA_KEYSPACE": keyspace,
+            "RABBITMQ_QUEUE": queue,
+            "ZOOKEEPER_ROOT": root,
+            "PRODUCER_INTERVAL_SECONDS": "0.05",
+            "COMMIT_EVERY": "1",
+            "CONSUMER_CRASH_AFTER": "",
+            "WORKER_DELAY_SECONDS": "0.02",
+            "SNAPSHOT_INTERVAL_SECONDS": "0.5",
+        }
+    )
+
+    observed: tuple[bool, str] = (False, "not run")
+    started = False
     shutdown_error = ""
+    first_snapshot: dict = {}
 
-    # The functional result is recorded rather than returned, so cleanup always
-    # runs and its outcome can take precedence over it.
     try:
-        setup_error = ""
-        try:
-            ensure_topic(topic, KAFKA_PARTITIONS, KAFKA_SERVER)
-        except (KafkaError, OSError, RuntimeError) as error:
-            setup_error = f"create-topics path failed: {error}"
-        else:
-            setup_error = _create_keyspace(keyspace)
-
+        setup_error = _prepare_topology(topic, keyspace, root)
         if setup_error:
             observed = (False, setup_error)
         else:
-            environment = os.environ | {
-                "KAFKA_TOPIC": topic,
-                "CONSUMER_GROUP": group,
-                # Keys of its own, so a topology someone else is running cannot
-                # satisfy this check.
-                "REDIS_KEY_PREFIX": prefix,
-                # A keyspace of its own, for the same reason.
-                "CASSANDRA_KEYSPACE": keyspace,
-                # A queue of its own, for the same reason.
-                "RABBITMQ_QUEUE": queue,
-                # Fast enough that the check is not waiting on simulated work.
-                "WORKER_DELAY_SECONDS": "0.02",
-                "PRODUCER_INTERVAL_SECONDS": "0.05",
-                # Commit every message, so offsets move within the budget.
-                "COMMIT_EVERY": "1",
-                # Never inject a crash into the topology under test.
-                "CONSUMER_CRASH_AFTER": "",
-            }
-            try:
-                honcho = subprocess.Popen(  # noqa: S603
-                    # Not `uv run honcho`: that would place Honcho in a session
-                    # of its own, outside the group this code signals.
-                    [".venv/bin/honcho", "start"],
-                    env=environment,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    # Its own process group, so the topology can be signalled.
-                    start_new_session=True,
-                )
-            except FileNotFoundError:
-                observed = (
-                    False,
-                    ".venv/bin/honcho is missing; run `uv sync --all-extras`",
-                )
+            if launch_error := topology.start():
+                observed = (False, launch_error)
             else:
-                observed = _observe_topology(
-                    honcho, group, topic, prefix, keyspace, queue
+                started = True
+                observed = topology.wait_until_ready(
+                    _readiness(group, prefix, keyspace, queue, root, first_snapshot),
+                    timeout=TOPOLOGY_SETTLE_SECONDS,
                 )
+                if observed[0]:
+                    readiness_detail = observed[1]
+                    working, detail = _leader_is_working(root, first_snapshot)
+                    if working:
+                        working, config_detail = _live_config_reaches_workers(root)
+                        detail = f"{detail}; {config_detail}"
+                    observed = (working, f"{readiness_detail}; {detail}")
     finally:
-        if honcho is not None:
-            stopped, shutdown_error = _stop_topology(honcho)
+        if started:
+            stopped, shutdown_error = topology.stop()
             if not stopped and not shutdown_error:
                 shutdown_error = "the topology did not stop"
-        # Only after the consumers have stopped: a live one would write the
-        # keys straight back.
+        # Only after the processes have gone: a live one would write it back.
         _clear_redis_prefix(prefix)
         _drop_keyspace(keyspace)
         _delete_queue(queue)
+        _delete_zookeeper_root(root)
         _delete_topic(topic)
 
     # Shutdown outranks the observation: a check that leaves the topology
     # running, or cannot tell whether it did, has not finished its job.
     if shutdown_error:
         return False, f"shutdown incomplete: {shutdown_error}"
-
     passed, detail = observed
     if passed:
-        return True, f"{detail}, and nothing was left running"
-    return passed, detail
+        return True, f"{detail}; nothing was left running"
+    return observed
+
+
+def _prepare_topology(topic: str, keyspace: str, root: str) -> str:
+    """Create everything the topology expects to already exist."""
+    try:
+        ensure_topic(topic, KAFKA_PARTITIONS, KAFKA_SERVER)
+    except (KafkaError, OSError, RuntimeError) as error:
+        return f"create-topics path failed: {error}"
+
+    if schema_error := _create_keyspace(keyspace):
+        return schema_error
+
+    try:
+        client = coordination.connect()
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return f"could not connect to ZooKeeper: {error}"
+    try:
+        coordination.initialise(client, coordination.Paths(root=root), 0.02)
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return f"cluster init path failed: {error}"
+    finally:
+        client.stop()
+        client.close()
+    return ""
+
+
+def _readiness(
+    group: str,
+    prefix: str,
+    keyspace: str,
+    queue: str,
+    root: str,
+    first_snapshot: dict,
+) -> list[tuple[str, object]]:
+    """Everything that must hold before the topology counts as working."""
+
+    def kafka_group() -> tuple[bool, str]:
+        members, error = _group_members(group)
+        if members is None:
+            return False, error
+        offsets, error = _group_offsets(group)
+        if offsets is None:
+            return False, error
+        if len(members) != KAFKA_PARTITIONS or len(offsets) != KAFKA_PARTITIONS:
+            return False, (
+                f"{len(members)} members owning {len(offsets)} partitions, "
+                f"wanted {KAFKA_PARTITIONS} of each"
+            )
+        return True, f"{len(members)} consumers own {len(offsets)} partitions"
+
+    def offsets_advance() -> tuple[bool, str]:
+        offsets, error = _group_offsets(group)
+        if offsets is None:
+            return False, error
+        total = sum(offsets.values())
+        previous = first_snapshot.get("offsets")
+        if previous is None:
+            first_snapshot["offsets"] = total
+            return False, "recorded a baseline; waiting for it to advance"
+        if total <= previous:
+            return False, f"committed offsets have not advanced past {previous}"
+        return True, f"committed offsets advanced {previous} to {total}"
+
+    def redis_branches() -> tuple[bool, str]:
+        counts, pages, error = _redis_state(prefix)
+        if counts is None:
+            return False, error
+        if not counts:
+            return False, f"no {prefix}pageviews:* counters"
+        if not pages:
+            return False, f"no {prefix}user:last_page:* values"
+        return True, f"{len(counts)} counters, {len(pages)} last-page values"
+
+    def cassandra_rows() -> tuple[bool, str]:
+        rows, error = _cassandra_rows(keyspace)
+        if rows is None:
+            return False, error
+        if not rows:
+            return False, f"no rows in {keyspace}"
+        missing = [
+            column
+            for column in ("user_id", "event_time", "event_id", "page")
+            if getattr(rows[0], column, None) in (None, "")
+        ]
+        if missing:
+            return False, f"rows missing {missing}"
+        return True, f"rows written to {keyspace}"
+
+    def rabbit_workers() -> tuple[bool, str]:
+        consumers, error = _queue_consumers(queue)
+        if consumers is None:
+            return False, error
+        if consumers != KAFKA_PARTITIONS:
+            return False, f"{consumers} workers on {queue}, expected {KAFKA_PARTITIONS}"
+        completed, _runs, error = _job_state(prefix)
+        if completed is None:
+            return False, error
+        if completed < 1:
+            return False, "no jobs completed"
+        return True, f"{consumers} workers, {completed} jobs completed"
+
+    def one_leader() -> tuple[bool, str]:
+        state, error = _coordination_state(root)
+        if state is None:
+            return False, error
+        leader = state["leader"]
+        if leader is None:
+            return (
+                False,
+                f"no acknowledged leader among {state['contenders']} contenders",
+            )
+        # Every role, not just workers: the previous version passed with four
+        # workers, zero consumers and any number of contenders.
+        expected = {
+            "contenders": (state["contenders"], COORDINATORS),
+            "coordinator registrations": (len(state["coordinators"]), COORDINATORS),
+            "consumer registrations": (len(state["consumers"]), KAFKA_PARTITIONS),
+            "worker registrations": (len(state["workers"]), KAFKA_PARTITIONS),
+        }
+        for label, (seen, wanted) in expected.items():
+            if seen != wanted:
+                return False, f"{seen} {label}, expected {wanted}"
+
+        # The leader must be one of the registered coordinators, not a process
+        # that wrote the marker and vanished.
+        identities = {entry["identity"] for entry in state["coordinators"]}
+        if leader["identity"] not in identities:
+            return False, (
+                f"leader {leader['identity']} is not among the registered "
+                f"coordinators {sorted(identities)}"
+            )
+
+        snapshot = state["snapshot"]
+        if snapshot.get("epoch") != leader["epoch"]:
+            return False, (
+                f"snapshot epoch {snapshot.get('epoch')} does not match "
+                f"leader epoch {leader['epoch']}"
+            )
+        first_snapshot.setdefault("version", state["snapshot_version"])
+        first_snapshot.setdefault("leader", leader)
+        return True, (
+            f"one leader at epoch {leader['epoch']} among {state['contenders']} "
+            f"contenders; {len(state['consumers'])} consumers and "
+            f"{len(state['workers'])} workers registered"
+        )
+
+    return [
+        ("kafka group", kafka_group),
+        ("offsets", offsets_advance),
+        ("redis", redis_branches),
+        ("cassandra", cassandra_rows),
+        ("rabbitmq", rabbit_workers),
+        ("zookeeper", one_leader),
+    ]
+
+
+def _live_config_reaches_workers(root: str) -> tuple[bool, str]:
+    """Publish a new delay and require every worker to report that exact version.
+
+    Without this the routine check would pass even if the whole watch path
+    broke: the workers would keep their startup values and nothing would say so.
+    Manual observation is not a substitute for a check that runs every time.
+    """
+    paths = coordination.Paths(root=root)
+    try:
+        client = coordination.connect()
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return False, f"could not connect to ZooKeeper: {error}"
+
+    try:
+        new_delay = "0.03"
+        stat = client.set(paths.worker_delay, new_delay.encode())
+        wanted = stat.version
+
+        deadline = time.monotonic() + LIVE_CONFIG_TIMEOUT_SECONDS
+        seen: list = []
+        while time.monotonic() < deadline:
+            entries = coordination.registrations(client, paths, "worker")
+            seen = [
+                (entry.get("config_version"), str(entry.get("delay")))
+                for entry in entries
+            ]
+            if len(seen) == KAFKA_PARTITIONS and all(
+                version == wanted and delay == new_delay for version, delay in seen
+            ):
+                return True, (
+                    f"all {KAFKA_PARTITIONS} workers applied worker_delay="
+                    f"{new_delay} at config version {wanted}"
+                )
+            time.sleep(0.5)
+        return False, (
+            f"workers did not all report config version {wanted} "
+            f"with delay {new_delay}; saw {seen}"
+        )
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return False, f"publishing live config failed: {error}"
+    finally:
+        client.stop()
+        client.close()
+
+
+def _leader_is_working(root: str, first: dict) -> tuple[bool, str]:
+    """A genuinely new snapshot from the same leader and epoch.
+
+    Reading the same znode twice would satisfy a naive "two snapshots", so this
+    requires the version to advance while the epoch and the leader stay put.
+    """
+    deadline = time.monotonic() + TOPOLOGY_PROGRESS_SECONDS
+    while time.monotonic() < deadline:
+        state, error = _coordination_state(root)
+        if state is None:
+            return False, error
+        if (
+            state["snapshot_version"] > first["version"]
+            and state["snapshot"].get("epoch") == first["leader"]["epoch"]
+            and state["leader"]
+            and state["leader"]["identity"] == first["leader"]["identity"]
+        ):
+            return True, (
+                f"leader {first['leader']['identity']} wrote again at epoch "
+                f"{first['leader']['epoch']} "
+                f"(snapshot v{first['version']} -> v{state['snapshot_version']})"
+            )
+        time.sleep(0.5)
+    return False, "the leader did not write a second snapshot at the same epoch"
 
 
 CHECKS: list[tuple[str, Callable[[], tuple[bool, str]]]] = [
