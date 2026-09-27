@@ -410,3 +410,112 @@ def test_resources_close_in_reverse_order(monkeypatch):
     assert closed.index("offsets.close") < closed.index("cassandra.shutdown")
     assert closed.index("cassandra.shutdown") < closed.index("redis.close")
     assert closed.index("redis.close") < closed.index("zookeeper.close")
+
+
+def test_a_session_lost_during_a_write_ends_the_tenure_cleanly(world, monkeypatch):
+    """What a frozen leader finds on waking: its pending transaction failed.
+
+    Found by the failover demonstration, which is what it is for. The coordinator
+    previously died with an unhandled SessionExpiredError instead of ending its
+    tenure and re-entering the election.
+    """
+    from kazoo.exceptions import SessionExpiredError
+
+    client, paths, _ = world
+
+    def expired(*args, **kwargs):
+        raise SessionExpiredError
+
+    monkeypatch.setattr(coordination, "write_snapshot", expired)
+
+    # Returns rather than raising.
+    coordinator.lead(client, paths, Leadership(), None, None, None)
+
+
+def test_a_connection_lost_during_a_write_resumes_the_same_tenure(world, monkeypatch):
+    """A lost connection is SUSPENDED, not LOST: the session may yet survive.
+
+    Ending the tenure here would re-enter the election while our own live marker
+    still occupied /leader, and every later winner would fail to acknowledge.
+    """
+    from kazoo.exceptions import ConnectionLoss
+
+    client, paths, stop = world
+    leadership = Leadership()
+    attempts = []
+    real_write = coordination.write_snapshot
+
+    def flaky(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            leadership.on_state(KazooState.SUSPENDED)
+            raise ConnectionLoss
+        real_write(*args, **kwargs)
+        stop.set()
+
+    def reconnect(seconds):
+        # Both the ConnectionLoss backoff and the pause branch sleep; either way
+        # the connection comes back and the same tenure continues.
+        leadership.on_state(KazooState.CONNECTED)
+
+    monkeypatch.setattr(coordination, "write_snapshot", flaky)
+    monkeypatch.setattr(coordinator.time, "sleep", reconnect)
+
+    coordinator.lead(client, paths, leadership, None, None, None)
+
+    assert len(attempts) >= 2, "the tenure did not resume after reconnecting"
+    # A voluntary stop, so its own marker is released.
+    assert _marker(client, paths) is None
+
+
+def test_a_connection_loss_followed_by_expiry_ends_the_tenure(world, monkeypatch):
+    """Only the listener reporting LOST ends it — not the write failing."""
+    from kazoo.exceptions import ConnectionLoss
+
+    client, paths, _ = world
+    leadership = Leadership()
+    attempts = []
+
+    def then_expires(*args, **kwargs):
+        attempts.append(1)
+        leadership.on_state(KazooState.SUSPENDED)
+        if len(attempts) >= 1:
+            # The session did not survive after all.
+            leadership.on_state(KazooState.LOST)
+            # A successor has taken over in the meantime.
+            client.delete(paths.leader)
+            client.create(
+                paths.leader,
+                json.dumps({"identity": "B", "epoch": 2}).encode(),
+                ephemeral=True,
+            )
+        raise ConnectionLoss
+
+    monkeypatch.setattr(coordination, "write_snapshot", then_expires)
+
+    coordinator.lead(client, paths, leadership, None, None, None)
+
+    assert _marker(client, paths)["identity"] == "B", "the successor's marker went"
+
+
+def test_a_session_lost_during_a_write_leaves_the_marker_alone(world, monkeypatch):
+    """Involuntary: ZooKeeper took ours, and a successor may own its replacement."""
+    from kazoo.exceptions import SessionExpiredError
+
+    client, paths, _ = world
+
+    def expired(*args, **kwargs):
+        # A successor has already taken over.
+        client.delete(paths.leader)
+        client.create(
+            paths.leader,
+            json.dumps({"identity": "B", "epoch": 2}).encode(),
+            ephemeral=True,
+        )
+        raise SessionExpiredError
+
+    monkeypatch.setattr(coordination, "write_snapshot", expired)
+
+    coordinator.lead(client, paths, Leadership(), None, None, None)
+
+    assert _marker(client, paths)["identity"] == "B"

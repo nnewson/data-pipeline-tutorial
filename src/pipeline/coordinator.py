@@ -16,7 +16,7 @@ import threading
 import time
 from contextlib import ExitStack
 
-from kazoo.exceptions import NodeExistsError
+from kazoo.exceptions import ConnectionLoss, NodeExistsError, SessionExpiredError
 from kazoo.recipe.election import Election
 
 from pipeline import (
@@ -34,6 +34,10 @@ from pipeline.config import (
 from pipeline.coordination import Leadership, Paths, StaleLeader
 
 logger = logging.getLogger("coordinator")
+
+# How long to wait before retrying a write that failed on a lost connection,
+# giving the state listener time to say whether the session survived.
+RECONNECT_PAUSE_SECONDS = 0.5
 
 stop_running = threading.Event()
 
@@ -176,6 +180,28 @@ def lead(
                 # Superseded: the marker is already someone else's.
                 logger.warning(f"stepping down: {error}")
                 return
+            except SessionExpiredError as error:
+                # The session is definitively gone — which is what a frozen
+                # leader finds when it resumes. The tenure is over and the epoch
+                # is void, but that is an ordinary end to a tenure rather than a
+                # crash: re-enter the election instead of dying with a
+                # traceback. The marker is left alone; ZooKeeper has already
+                # removed ours, and a successor may own its replacement.
+                logger.warning(f"session expired during a snapshot write: {error}")
+                return
+            except ConnectionLoss as error:
+                # NOT the same thing, and treating it as such contradicted this
+                # release's own lesson. A lost connection means SUSPENDED: the
+                # session may yet survive, and with it this tenure and its
+                # marker. Ending here would re-enter the election while our own
+                # live marker still occupied /leader, and every later winner
+                # would then fail to acknowledge.
+                #
+                # So pause. The loop's may_work check resumes the same tenure on
+                # CONNECTED, or ends it if the listener reports LOST.
+                logger.warning(f"connection lost during a snapshot write: {error}")
+                time.sleep(RECONNECT_PAUSE_SECONDS)
+                continue
 
             stop_running.wait(SNAPSHOT_INTERVAL_SECONDS)
         voluntary = True
