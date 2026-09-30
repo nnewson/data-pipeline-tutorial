@@ -53,6 +53,7 @@ def connect(
     hosts: list[str] = CASSANDRA_HOSTS,
     port: int = CASSANDRA_PORT,
     keyspace: str | None = None,
+    retries: int = 10,
 ) -> tuple[Cluster, Session]:
     """Open a cluster connection, retrying until Cassandra accepts it."""
 
@@ -77,7 +78,7 @@ def connect(
             raise
         return cluster, session
 
-    return wait_for_connection("Cassandra", open_session)
+    return wait_for_connection("Cassandra", open_session, retries=retries)
 
 
 KEYSPACE_PLACEHOLDER = "${KEYSPACE}"
@@ -135,13 +136,25 @@ def record_pageview(session: Session, insert: PreparedStatement, event: dict) ->
     )
 
 
-def user_history(session: Session, user_id: str, limit: int = 20) -> list:
-    """One user's events, most recent first — the query the table was shaped for."""
+def user_history(
+    session: Session, user_id: str, limit: int = 20, timeout: float | None = None
+) -> list:
+    """One user's events, most recent first — the query the table was shaped for.
+
+    `written_at` is `writetime(page)`: the page cell's write timestamp, which the
+    driver generates client-side. It records when the consumer issued the write,
+    by the consumer host's clock, not when Cassandra persisted anything.
+
+    `timeout` bounds the request; None keeps the driver's default of 10s. It is
+    not passed through as None, which the driver reads as "wait forever".
+    """
+    options = {} if timeout is None else {"timeout": timeout}
     return list(
         session.execute(
             f"SELECT event_time, event_id, page, writetime(page) AS written_at "
             f"FROM {TABLE} WHERE user_id = %s LIMIT %s",
             (user_id, limit),
+            **options,
         )
     )
 

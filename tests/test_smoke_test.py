@@ -1,4 +1,5 @@
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 from kafka.errors import KafkaConnectionError, KafkaError
@@ -616,6 +617,7 @@ def test_the_topology_gets_isolated_state(monkeypatch):
     assert captured["CASSANDRA_KEYSPACE"].startswith("smoke_")
     assert captured["RABBITMQ_QUEUE"].startswith("smoke_jobs_")
     assert captured["ZOOKEEPER_ROOT"].startswith("/smoke_")
+    assert int(captured["API_PORT"]) > 0
 
 
 def test_everything_is_cleaned_up_when_honcho_cannot_start(monkeypatch):
@@ -740,3 +742,163 @@ def test_live_config_passes_when_all_four_applied_it(monkeypatch):
 
     assert ready is True
     assert "all 4 workers applied worker_delay=0.03" in detail
+
+
+# --- the API predicate --------------------------------------------------------
+
+SENTINELS = smoke_test.Sentinels.for_run("abc")
+
+
+def _api_answers(**overrides):
+    """What a working API answers, with any path's answer replaced."""
+    s = SENTINELS
+    answers = {
+        "/health": (200, {"status": "ok"}),
+        f"/counts/pages?page={s.page}": (200, {"counts": {s.page: s.count}}),
+        f"/users/{s.user}/last-page": (200, {"page": s.page}),
+        f"/users/nobody-{s.user}/last-page": (404, {"detail": "no last page"}),
+        f"/users/{s.user}/events": (
+            200,
+            {"events": [{"event_id": s.event_id, "written_at": "2026-09-28T00:00Z"}]},
+        ),
+        f"/users/{s.user}/events?limit=101": (422, {"detail": []}),
+        "/cluster": (
+            200,
+            {"leader": {"identity": "host-1"}, "snapshot_matches_leader": True},
+        ),
+        "/openapi.json": (200, {"paths": dict.fromkeys(smoke_test.API_ROUTES)}),
+    }
+    answers.update(overrides)
+    return lambda port, path: (*answers[path], "")
+
+
+def _api_check(monkeypatch, **overrides):
+    monkeypatch.setattr(smoke_test, "_api_get", _api_answers(**overrides))
+    return smoke_test._api_serves_the_stores(
+        8123, SENTINELS, {"leader": {"identity": "host-1"}}
+    )
+
+
+def test_the_api_predicate_passes_when_every_sentinel_reads_back(monkeypatch):
+    passed, detail = _api_check(monkeypatch)
+
+    assert passed, detail
+
+
+def test_the_api_predicate_requires_the_exact_sentinel_count(monkeypatch):
+    passed, detail = _api_check(
+        monkeypatch,
+        **{
+            f"/counts/pages?page={SENTINELS.page}": (
+                200,
+                {"counts": {SENTINELS.page: 8}},
+            )
+        },
+    )
+
+    assert not passed
+    assert "wanted 7" in detail
+
+
+def test_the_api_predicate_requires_a_404_for_an_unknown_user(monkeypatch):
+    unknown = f"/users/nobody-{SENTINELS.user}/last-page"
+    passed, detail = _api_check(monkeypatch, **{unknown: (200, {"page": "/"})})
+
+    assert not passed
+    assert "unknown user" in detail
+
+
+def test_the_api_predicate_requires_the_bounded_limit(monkeypatch):
+    over = f"/users/{SENTINELS.user}/events?limit=101"
+    passed, detail = _api_check(monkeypatch, **{over: (200, {"events": []})})
+
+    assert not passed
+    assert "wanted 422" in detail
+
+
+def test_the_api_predicate_waits_for_the_snapshot_to_match(monkeypatch):
+    passed, detail = _api_check(
+        monkeypatch,
+        **{"/cluster": (200, {"leader": None, "snapshot_matches_leader": False})},
+    )
+
+    assert not passed
+    assert "does not match" in detail
+
+
+def test_the_api_predicate_requires_the_leader_zookeeper_reported(monkeypatch):
+    passed, detail = _api_check(
+        monkeypatch,
+        **{
+            "/cluster": (
+                200,
+                {"leader": {"identity": "impostor"}, "snapshot_matches_leader": True},
+            )
+        },
+    )
+
+    assert not passed
+    assert "impostor" in detail
+
+
+def test_the_api_predicate_reports_an_unreachable_api(monkeypatch):
+    monkeypatch.setattr(
+        smoke_test, "_api_get", lambda port, path: (None, None, "not answering")
+    )
+
+    passed, detail = smoke_test._api_serves_the_stores(8123, SENTINELS, {})
+
+    assert not passed
+    assert detail == "not answering"
+
+
+def test_readiness_checks_the_api_last_when_given_one():
+    names = [
+        name
+        for name, _ in smoke_test._readiness(
+            "grp", "p:", "ks", "q", "/root", {}, api=(8123, SENTINELS)
+        )
+    ]
+
+    assert names[-1] == "api"
+    assert names[-2] == "zookeeper"
+
+
+def _write_predicates(monkeypatch, counts, pages, rows):
+    monkeypatch.setattr(smoke_test, "_redis_state", lambda prefix: (counts, pages, ""))
+    monkeypatch.setattr(smoke_test, "_cassandra_rows", lambda keyspace: (rows, ""))
+    predicates = dict(
+        smoke_test._readiness(
+            "grp", "p:", "ks", "q", "/root", {}, api=(8123, SENTINELS)
+        )
+    )
+    return predicates["redis"], predicates["cassandra"]
+
+
+def _row(user):
+    return SimpleNamespace(user_id=user, event_time="t", event_id="e", page="/docs")
+
+
+def test_sentinels_alone_do_not_pass_the_write_predicates(monkeypatch):
+    """The consumers must have written something; the sentinels do not count."""
+    redis_ready, cassandra_ready = _write_predicates(
+        monkeypatch,
+        counts={SENTINELS.page: SENTINELS.count},
+        pages={SENTINELS.user: SENTINELS.page},
+        rows=[_row(SENTINELS.user)],
+    )
+
+    assert redis_ready()[0] is False
+    assert cassandra_ready()[0] is False
+
+
+def test_consumer_writes_beside_the_sentinels_pass(monkeypatch):
+    redis_ready, cassandra_ready = _write_predicates(
+        monkeypatch,
+        counts={SENTINELS.page: SENTINELS.count, "/docs": 4},
+        pages={SENTINELS.user: SENTINELS.page, "ada": "/docs"},
+        rows=[_row(SENTINELS.user), _row("ada")],
+    )
+
+    assert redis_ready() == (True, "1 counters, 1 last-page values")
+    assert cassandra_ready()[0] is True

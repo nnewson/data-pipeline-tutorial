@@ -29,3 +29,7 @@ worker_4: .venv/bin/worker
 coordinator_1: .venv/bin/coordinator
 coordinator_2: .venv/bin/coordinator
 coordinator_3: .venv/bin/coordinator
+# One API process, reading all three stores. uvicorn runs in-process: no
+# --reload and no --workers, either of which would put a supervisor of its own
+# inside the one Honcho already provides.
+api: .venv/bin/api

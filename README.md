@@ -4,18 +4,19 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.7 — ZooKeeper.** Three coordinators compete for one
-leadership, and the winner alone writes a snapshot of the pipeline. The
-delivery-semantics thread so far has been about a *message* arriving twice; this
-one is about a **role** being held twice — and the fix is not a better election but a fencing token that
-lets the write itself refuse the loser.
+**This release: 0.8 — FastAPI.** The pipeline becomes visible without a CLI:
+an HTTP API over Redis, Cassandra and ZooKeeper, one endpoint per store. Each
+store answers a different question with different freshness and consistency
+properties, and an API is where a system either states those properties or
+quietly averages them away. This one states only what each source can prove —
+and, when a store freezes, answers within a bound it can also state.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.7
+git checkout 0.8
 ```
 
 ## Prerequisites
@@ -60,8 +61,8 @@ Cassandra takes 40–90 seconds to accept connections on a first start, so
 `docker compose up -d --wait` will sit there for a while before returning. It
 has not hung.
 
-Then start everything — a producer, four consumers, four workers, and three
-coordinators:
+Then start everything — a producer, four consumers, four workers, three
+coordinators, and the API:
 
 ```bash
 uv run honcho start
@@ -733,8 +734,323 @@ each call. It is honest to say so rather than claim a uniformity the code does n
 have — and it is the obvious next thing to fix if the snapshot interval ever gets
 short enough for it to matter.
 
-0.8 serves this snapshot over HTTP — which is why the leader exists at all rather
-than merely recording that it is the leader.
+`/cluster` serves this snapshot over HTTP — which is why the leader exists at all
+rather than merely recording that it is the leader.
+
+## An API over three stores
+
+The API is one more process in the Procfile, so `honcho start` brings it up with
+everything else:
+
+```bash
+curl -s localhost:8000/cluster
+```
+
+```json
+{
+  "leader": {"identity": "Nicks-MacBook-Pro.local-58525", "epoch": 1, "since": "2026-09-28T21:37:12.840619Z"},
+  "snapshot": {"version": 6, "epoch": 1, "at": "2026-09-28T21:37:23.002586Z", "pageviews": 11, "...": "..."},
+  "snapshot_matches_leader": true,
+  "registrations": {"coordinator": ["..."], "consumer": ["..."], "worker": ["..."]},
+  "observed_at": "2026-09-28T21:37:24.118205Z"
+}
+```
+
+[localhost:8000/docs](http://localhost:8000/docs) is the generated OpenAPI page,
+which is most of why this is FastAPI rather than Flask: request validation and a
+published contract, both derived from the type annotations rather than written
+twice.
+
+One endpoint, one store:
+
+| endpoint | store | nothing there | store down |
+|---|---|---|---|
+| `GET /health` | none | — | — |
+| `GET /counts/pages?page=` | Redis | `{}` | 503 |
+| `GET /users/{user_id}/last-page` | Redis | **404** | 503 |
+| `GET /users/{user_id}/events?limit=` | Cassandra | `[]` | 503 |
+| `GET /cluster` | ZooKeeper | leader `null` | 503 |
+
+`/health` is liveness only: it touches no store and never waits for a thread, so
+a stalled store cannot make the process look dead when it is merely busy.
+
+**404 for a last page, `[]` for events.** The last-page resource *is* the value
+Redis holds, so when there is no value the resource is absent. Events are a
+collection, and Cassandra cannot tell an unknown user from one with no events.
+Restart Redis and the two disagree about whether they know a user — and both
+are right, because one is a deliberately volatile view (0.4) and the other a
+durable one (0.5).
+
+`limit` is bounded in the contract (1 to 100, default 20), not merely in the
+query, and anything outside it is a 422. "One partition" does not make an
+arbitrarily large partition read safe.
+
+`/counts/pages` counts **named pages**: up to twenty `page` parameters, defaulting
+to the producer's four-page catalogue, read in one `MGET`. A page with no counter
+is left out. The first version discovered pages instead, with `SCAN` — and
+`SCAN` visits every key and filters afterwards, including one last-page key per
+user, so the route's cost grew with *users* rather than pages: 381 keys took four
+round trips. That is the same trap as a user listing, so it goes the same way.
+Discovering arbitrary pages cheaply would need a different data model — a hash
+of counters, say — which is a write-path change this release does not make.
+
+What is deliberately *not* here: no writes, because an HTTP producer would be a
+second entry point with none of Kafka's partitioning, ordering or replay; no
+fan-out reads, which would couple one response's availability to every store;
+no cache, because Redis already is one; no user listing, which Cassandra cannot
+answer without scanning; and no correct durable total. `/counts/pages` lets you
+sum the counters, and its OpenAPI description says what that sum is worth after
+a replay.
+
+The API is a host process like everything else in the Procfile, so it has one
+address, `localhost:8000`. There is no `api:8000`: Compose DNS names only the
+services Compose runs, and nothing inside the network is a client of the API.
+It is 0.1's lesson in reverse — the second address exists only for things
+Compose runs.
+
+## What each store can actually prove
+
+The rule for every response: **expose only metadata the source genuinely owns.**
+
+- **Redis** keeps no update timestamp and no consumed-offset watermark, so it
+  cannot state its own age, and the API does not invent one.
+- **Cassandra** does have per-row metadata. `written_at` is `writetime(page)`,
+  **the page cell's write timestamp**. The driver generates it client-side, so it
+  records when the consumer *issued* the write, by the consumer host's clock —
+  not when Cassandra persisted anything. After a replay it advances while the
+  event itself stays put: 0.5's upsert, visible over HTTP.
+- **ZooKeeper** carries the snapshot's `at` and `epoch`, which let a client
+  detect staleness rather than be promised freshness.
+- **`observed_at`** is the API's own read time, labelled as exactly that.
+
+The driver returns *naive* datetimes that are UTC, and serialising one as-is
+silently drops the offset. Every timestamp here is converted to UTC-aware first,
+and `written_at` (microseconds since the epoch) with integer arithmetic rather
+than through a float. Checked against the stored row rather than trusted:
+
+```text
+API      event_time 2026-09-28T21:39:55.312000Z  written_at 2026-09-28T21:39:55.316788Z
+cqlsh    event_time 2026-09-28 21:39:55.312000+0000  writetime 1790631595316788
+```
+
+## `/cluster` is several reads, and says so
+
+`/leader`, `/snapshot` and the registrations are separate reads, and they can
+span a handover. The response may legitimately report leader B while the latest
+snapshot still belongs to A, so it carries `snapshot_matches_leader` rather than
+retrying until the answer looks tidy. Two different things produce `false`: read
+skew across the separate reads, and a genuine transitional state in which B
+leads but has not written yet. Both are true of the system, so neither is hidden.
+
+It is **`false` whenever either side is absent**, not only when both are present
+and differ. `cluster init` pre-creates the snapshot as `{"epoch": null}`, so with
+nobody leading, a naive comparison is `None == None` — a match on a cluster with
+no leader.
+
+Watched through `failover-demo`, polling every 50ms, it was less dramatic than
+the design allows, and more instructive. The transitional `false` during the
+handover was **missed**: B's leadership and its first snapshot arrived between
+two polls. What did show up was `false` at the start, with no leader and a
+snapshot left over from an earlier epoch — and **`true` for the ten seconds
+leader A was frozen**. A was still the leader on record, and the latest
+snapshot was its own. A match tells you whose snapshot it is, not how fresh it
+is. That is what `at` is for.
+
+## Freezing a dependency
+
+The interesting failure is not a store that goes away but one that stops
+answering. `docker compose stop` closes the socket, and clients fail at once;
+`docker compose pause` freezes the container with its sockets open, so requests
+hang instead. Measured with the API under load — 24 clients hammering the
+affected route while others kept using the rest:
+
+| store | affected route | the other routes | recovery |
+|---|---|---|---|
+| Redis stopped | `503 redis unavailable` in milliseconds | unaffected | on the next request |
+| Redis paused | 8 requests admitted, each `unavailable` after 1.0s; the rest `busy` at once | unaffected | immediate |
+| Cassandra stopped | `unavailable` in milliseconds | unaffected | 12s after restart, as the driver reconnects |
+| Cassandra paused | 8 admitted, each `unavailable` at the 2.0s deadline; the rest `busy` | unaffected | immediate |
+| ZooKeeper stopped | `unavailable` without a request reaching kazoo | unaffected | 2.5s |
+| ZooKeeper paused | 4 admitted, timing out after 1.0s and *still held*; the rest `busy`; after 6.6s kazoo notices and everything is `unavailable` | unaffected | 0.1s, on a new session |
+
+Two different 503s, deliberately:
+
+```json
+{"detail": "cassandra busy"}          refused at admission; Cassandra was never called
+{"detail": "cassandra unavailable"}   the call failed or ran out of time
+```
+
+Busy means back off; unavailable means the store is the problem. And in every
+case the API recovered without being restarted: it holds one client per store
+for the life of the process, and the clients reconnect on their own.
+
+## A timeout ends the wait, not the work
+
+Keeping the other routes unaffected took more than a `timeout=` argument.
+
+The clients are synchronous, so every store call runs on a worker thread, and by
+default they all share one allowance of 40. Forty requests stuck on a frozen
+Cassandra would then delay Redis requests while Redis is healthy. So each store
+has a **bulkhead** — its own admission limit and worker allowance — and its
+promise is exactly this wide:
+
+> A stalled store cannot consume another store's worker allowance. CPU, memory
+> and the event loop remain shared.
+
+| store | limit | why that size |
+|---|---|---|
+| Redis (both routes) | 8 | one pooled connection per in-flight call |
+| Cassandra | 8 | the driver multiplexes; this bounds waiting threads |
+| ZooKeeper | 4 | one session on one connection, served in order |
+
+These are tutorial defaults, not derived numbers — a reasonable place to start
+measuring. Ordinary traffic leaves plenty of headroom: two pollers per route saw
+no refusals, at a p95 of 7ms (21ms for `/cluster`). Bursts far past the limits
+produced nothing but `busy` refusals, and every route answered normally straight
+afterwards. The caveat in the promise is real, though: at 64 simultaneous
+requests a refusal reached the client in about 40ms, at 800 in up to 2s. A
+refusal costs no store time, but it still waits its turn on the one event loop.
+
+The two Redis routes share one allowance because they share one client, one
+pool and one server. That buys isolation between *stores*, not fairness between
+*routes*: in a burst, `/counts/pages` took all eight slots and every
+`/last-page` request was refused.
+
+Two measurements show why the work, not just the wait, has to be bounded.
+
+**redis-py's defaults take a minute to fail.** Against a server that accepts a
+connection and never replies — what `pause` produces — one default `GET` took
+**57.9s**: a 5s socket timeout and ten retries with backoff. The API sets a 1s
+timeout and no retries, so a restart can cost one transient 503, which the
+contract allows. A fresh connection is also more than one exchange: redis-py 8.1
+sends `HELLO`, `CLIENT MAINT_NOTIFICATIONS` and two `CLIENT SETINFO` before the
+command, so one command's worst case is the connect timeout plus five socket
+timeouts. Each Redis route is a single command, one `MGET` or one `GET`, and
+redis-py cannot be interrupted mid-command, so a read can finish after the
+route's 2s deadline. When it does, the answer is a 503 rather than a late
+success — the same rule as every other store, applied in one place.
+
+**Abandoned ZooKeeper reads hide the outage.** kazoo's synchronous calls take no
+timeout, so the API sends each read asynchronously and waits with one. But a
+timeout ends the *wait*: kazoo keeps the request. Against a paused ZooKeeper,
+with a read abandoned every second or so:
+
+| admission released | held by kazoo after 20s | kazoo's state |
+|---|---|---|
+| when the caller gives up | 16, one more per request | `CONNECTED` throughout |
+| when the request completes (limit 4) | 4 | `SUSPENDED` after 10.4s |
+
+kazoo detects a dead server by an unanswered heartbeat, and it only sends one
+after a quiet spell — and **it counts every request it sends as a heartbeat**,
+reply or not. So a caller abandoning requests and sending new ones keeps the
+client from ever noticing, while the abandoned reads pile up. Holding admission
+until each request truly completes caps the pile at the limit, stops the traffic
+that was masking the outage, and kazoo notices — one read timeout, two-thirds of
+the session timeout, after the last request it sent. In that probe the four
+slots filled one read at a time, so it took 10.4s; under the API's load they
+filled at once, and it took 6.6s.
+
+The same rule holds for the other stores, with different consequences. redis-py
+disconnects on a timeout, so nothing lingers on the client. A timed-out
+Cassandra request becomes an *orphaned stream* on its connection — the thread is
+free, but the server may still run the query when it resumes — and the paused
+run peaked at 112 of them, about eight every two seconds, all gone after
+recovery.
+
+## Admission, precisely
+
+This is the part that needed the most care, and the part most likely to be
+wrong in a first attempt.
+
+Each admission is a small **permit**, and the permit releases its slot exactly
+once, when every holder has let go. There are up to three holders:
+
+- the **dispatcher**, until its `run_sync` call has returned;
+- the **worker thread**, until the read returns *in that thread*;
+- a **ZooKeeper request** the read gave up on, until kazoo completes it.
+
+```python
+permit = self.admit()  # or 503 busy, at once
+worker = _WorkerHold(permit)  # the thread's own hold
+try:
+    result = await anyio.to_thread.run_sync(
+        worker.run, read, budget, limiter=self._workers, abandon_on_cancel=False
+    )
+    budget.remaining()  # finished past the deadline: unavailable, not late
+finally:
+    worker.dispatcher_leaving()  # gives the hold up only if the thread never ran
+    permit.dispatch_finished()
+```
+
+- **Why not release a semaphore directly?** A late duplicate release goes
+  unnoticed. `BoundedSemaphore` complains only when its count would exceed its
+  starting value, so a duplicate arriving after another request has taken the
+  returned slot is accepted silently — freeing a slot that request is still
+  using. Duplicates are not hypothetical: kazoo's `rawlink` re-dispatches every
+  callback on a result that has already completed.
+- **Why a thread-safe semaphore at all?** Admission happens on the event loop,
+  but a kazoo completion arrives on kazoo's own thread.
+- **Why does the thread hold the permit itself?** A thread cannot be
+  interrupted, so a cancelled request must not give its slot back while its call
+  is still running. `abandon_on_cancel=False` makes anyio's own cancellation wait
+  for the thread — but not asyncio's. Measured: a native `Task.cancel()`
+  interrupted the await at once, and anyio returned the *worker token* while the
+  thread ran on. So the limiter keeps each store's threads out of the shared
+  default, and the permit, held by the thread, is what caps calls into the store.
+  If the task is cancelled before its thread has started, the read never runs
+  and that hold is given up instead.
+- **Why the dispatcher's hold too?** On the ordinary path it is dropped after
+  `run_sync` returns, when anyio has already released the worker token, so an
+  admitted request does not wait for a thread.
+
+Each of those is a unit test, and each test was checked by reintroducing the
+defect it guards against and watching it fail. That is not the same as complete:
+the first version passed all of them and still let native cancellation through,
+which a review found, not a test. The decisive test holds every Cassandra slot
+at a barrier: the next Cassandra request is refused as busy *without the store
+being called*, Redis and `/health` still answer, and Cassandra's capacity
+returns when the barrier opens.
+
+## Starting, and stopping
+
+The API connects to all three stores before it serves anything, as every other
+process here does, and retries while a store is still coming up — but three
+times, not the pipeline's ten. A shared retry helper does not need identical
+patience: the documented workflow already waits for the stores to be healthy,
+and ten attempts against a paused ZooKeeper left the API without a listener for
+three minutes. Each attempt is bounded, so a store that never answers fails
+startup rather than hanging it. Observed with each store paused — durations for
+that failure mode, not a universal worst case, since a store answering slowly
+takes a different path:
+
+| paused | ten attempts | three attempts |
+|---|---|---|
+| Redis | 37.4s | 9.5s |
+| Cassandra | 127.6s | 36.5s |
+| ZooKeeper | 178.0s | 66.8s |
+
+Two three-second sleeps account for 6s of each; the rest is the attempts, which
+take about 1s for Redis, 10s for Cassandra and 20s for ZooKeeper.
+
+It connects *before* uvicorn starts, which is a detail with a measurement behind
+it. uvicorn captures SIGTERM and SIGINT for its whole run, including the
+lifespan's startup, and acts on them only once startup has finished. With the
+connection inside the lifespan, a SIGTERM five seconds into a startup stalled on
+a paused Redis took effect **32.5 seconds** later. Connecting first leaves both
+signals with their ordinary meaning until there is something to serve.
+
+Ownership then passes to the lifespan, which closes the clients on shutdown —
+but only once the lifespan is actually running. uvicorn can exit before it ever
+starts one: with `WEB_CONCURRENCY=2` set it refused to run workers for an app
+object and exited, and a first version of the hand-over had already given the
+clients away, so nothing closed them. Until the lifespan takes them, `main`
+still owns them. And `workers=1` is passed explicitly, so that environment
+variable cannot turn the single process into several.
+
+uvicorn runs in-process — no `--reload`, which adds a file-watching parent, and
+no `--workers`, which adds children. After 0.3's leak history, a supervisor
+inside a supervised process is the last thing this topology needs. Once
+serving, it starts in about 0.4s and exits about 0.2s after SIGTERM.
 
 ## Derived state, and rebuilding it
 
@@ -880,7 +1196,8 @@ RabbitMQ follows the same pattern: `localhost:5672` from the host,
 `rabbitmq:5672` from inside the network, with the management UI published
 separately at [localhost:15672](http://localhost:15672). ZooKeeper is
 `localhost:2181` and `zookeeper:2181` — the last new service before Flink brings
-a jobmanager and taskmanager of its own at 0.10.
+a jobmanager and taskmanager of its own at 0.10. The API has only
+`localhost:8000`, because it is a host process and no container is its client.
 
 It also needs a real user, which the others do not. RabbitMQ's built-in `guest`
 account may only connect over the broker's own loopback interface, so a client
@@ -924,9 +1241,9 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 137 to 239; 4 counters, 246 last-page values; rows written to smoke_bc837f27; 4 workers, 247 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; leader …-99608 wrote again at epoch 1 (snapshot v27 -> v28); all 4 workers applied worker_delay=0.03 at config version 1; nothing was left running
+PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 115 to 212; 5 counters, 220 last-page values; rows written to smoke_95ba3f32; 4 workers, 219 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; API on port 57650 read back the Redis, Cassandra and ZooKeeper sentinels and states its 404 and 422 contracts; leader …-58386 wrote again at epoch 1 (snapshot v24 -> v25); all 4 workers applied worker_delay=0.03 at config version 1; nothing was left running
 
-all 4 checks passed in 18.2s
+all 4 checks passed in 17.7s
 ```
 
 On a brand new cluster you will also see `NotCoordinatorError` once or twice
@@ -958,7 +1275,21 @@ hold, under one shared deadline:
   the registered coordinators, not a marker written by a process that vanished;
 - a second snapshot from the *same* leader at the *same* epoch, with an advanced
   version, because reading one znode twice is not two snapshots;
-- a published worker delay reaching all four workers at the exact znode version.
+- a published worker delay reaching all four workers at the exact znode version;
+- the API, running inside the run's environment on a port of its own, reading
+  back known sentinel values from each store — a counter and a last page in
+  Redis, an event in Cassandra — plus a `/cluster` whose leader matches the one
+  ZooKeeper reported, a 404 for an unknown user, a 422 for `limit=101`, and an
+  OpenAPI document listing every route.
+
+The API check uses sentinels rather than whatever the producer happened to
+write, because it tests the read path only — the other predicates already prove
+the writes — and two reads of a moving value disagree. The sentinels sit under
+the same prefix and keyspace the consumers write to, so the write predicates
+leave them out: otherwise the sentinels alone would satisfy them, and a consumer
+that wrote nothing would pass. Its port is chosen by
+binding port 0 and releasing it, so something else could take it in the moment
+before the API binds it. A small window, accepted rather than hidden.
 
 That last one matters: without it the check would pass with the whole watch path
 broken, because the workers would keep their startup values and nothing would
@@ -997,6 +1328,8 @@ src/pipeline/
     cluster.py           creates the coordination tree, and inspects it
     runtime_config.py    settings that can change while a process runs
     failover_demo.py     the two-leaders demonstration
+    api.py               the HTTP API: one endpoint per store, bounded reads
+    bulkhead.py          per-store admission, worker allowance and deadline
     topology_runner.py   starts, observes and stops the whole topology
     smoke_test.py        bounded assertions against a running broker
 tests/

@@ -7,13 +7,16 @@ only the happy path had coverage.
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
-from conftest import FakeClient, FakeTransaction  # noqa: F401
-from kazoo.exceptions import BadVersionError, NodeExistsError
+from conftest import FakeClient, FakeStat, FakeTransaction  # noqa: F401
+from kazoo.exceptions import BadVersionError, NodeExistsError, NoNodeError
+from kazoo.handlers.threading import KazooTimeoutError
 from kazoo.protocol.states import KazooState
 
 from pipeline import coordination
+from pipeline.bulkhead import DeadlineExceeded
 from pipeline.coordination import Leadership, Paths
 
 
@@ -601,7 +604,11 @@ def test_a_correction_after_an_invalid_value_is_applied(monkeypatch):
         time.sleep(0.01)
     watcher.stop()
 
-    assert applied == [0.25]
+    # At least once, and only the corrected value. Not exactly once: the
+    # watcher re-reads on every retry wake whether or not a watch fired, and at
+    # the 10ms retry used here a second read can land before stop() — which
+    # made `applied == [0.25]` fail about one run in twenty.
+    assert applied and set(applied) == {0.25}
 
 
 def test_a_registration_from_a_lost_session_is_discarded(monkeypatch):
@@ -703,3 +710,134 @@ def test_a_registration_accepted_while_lost_does_not_report_success(monkeypatch)
     presence.stop()
 
     assert started is False, "reported success with no live registration"
+
+
+# --- bounded reads, for the API ---------------------------------------------
+
+
+class _Done:
+    """An AsyncResult that has already completed."""
+
+    def __init__(self, value=None, error=None):
+        self.value, self.error = value, error
+        self.linked = []
+
+    def get(self, timeout=None):
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+    def rawlink(self, callback):
+        self.linked.append(callback)
+
+
+class _Outstanding(_Done):
+    """An AsyncResult whose reply has not arrived: the wait times out."""
+
+    def get(self, timeout=None):
+        self.waited = timeout
+        raise KazooTimeoutError
+
+
+class _AsyncClient:
+    """Only the async half of kazoo, so a sync call here is a test failure."""
+
+    def __init__(self, results):
+        self.handler = SimpleNamespace(timeout_exception=KazooTimeoutError)
+        self.results = results
+        self.sent = []
+
+    def _send(self, method, path):
+        self.sent.append((method, path))
+        return self.results[(method, path)]
+
+    def get_async(self, path, watch=None):
+        return self._send("get", path)
+
+    def exists_async(self, path, watch=None):
+        return self._send("exists", path)
+
+    def get_children_async(self, path, watch=None):
+        return self._send("get_children", path)
+
+
+class _Budget:
+    def __init__(self, timeout=0.7, spent=False):
+        self.timeout, self.spent = timeout, spent
+        self.abandoned = []
+
+    def call_timeout(self):
+        if self.spent:
+            raise DeadlineExceeded
+        return self.timeout
+
+    def abandon(self, result):
+        self.abandoned.append(result)
+
+
+def test_a_bounded_read_waits_only_for_the_budgets_timeout():
+    paths = Paths(root="/t")
+    pending = _Outstanding()
+    client = _AsyncClient({("get", paths.leader): pending})
+    budget = _Budget(timeout=0.7)
+
+    with pytest.raises(KazooTimeoutError):
+        coordination.read_leader(client, paths, budget)
+
+    assert pending.waited == 0.7
+
+
+def test_a_timed_out_read_is_handed_over_not_forgotten():
+    """A timeout ends the wait; kazoo still holds the request."""
+    paths = Paths(root="/t")
+    pending = _Outstanding()
+    client = _AsyncClient({("get", paths.snapshot): pending})
+    budget = _Budget()
+
+    with pytest.raises(KazooTimeoutError):
+        coordination.read_snapshot(client, paths, budget)
+
+    assert budget.abandoned == [pending]
+
+
+def test_a_spent_budget_sends_nothing():
+    paths = Paths(root="/t")
+    client = _AsyncClient({})
+    with pytest.raises(DeadlineExceeded):
+        coordination.read_leader(client, paths, _Budget(spent=True))
+
+    assert client.sent == []
+
+
+def test_a_missing_leader_is_a_completed_read_not_an_abandoned_one():
+    paths = Paths(root="/t")
+    client = _AsyncClient({("get", paths.leader): _Done(error=NoNodeError())})
+    budget = _Budget()
+
+    assert coordination.read_leader(client, paths, budget) is None
+    assert budget.abandoned == []
+
+
+def test_bounded_registrations_hand_over_nothing_when_every_read_completes():
+    paths = Paths(root="/t")
+    base = f"{paths.registry}/worker"
+    client = _AsyncClient(
+        {
+            ("exists", base): _Done(FakeStat()),
+            ("get_children", base): _Done(["a", "b"]),
+            ("get", f"{base}/a"): _Done((b'{"identity": "w1"}', FakeStat())),
+            ("get", f"{base}/b"): _Done((b'{"identity": "w2"}', FakeStat())),
+        }
+    )
+    budget = _Budget()
+
+    found = coordination.registrations(client, paths, "worker", budget)
+
+    assert [entry["identity"] for entry in found] == ["w1", "w2"]
+    assert budget.abandoned == []
+    assert [method for method, _ in client.sent] == [
+        "exists",
+        "get_children",
+        "get",
+        "get",
+    ]
