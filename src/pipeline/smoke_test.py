@@ -8,11 +8,16 @@ stays a caller and the success criteria stay reviewable code.
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
@@ -504,6 +509,159 @@ def _delete_zookeeper_root(root: str) -> None:
         client.close()
 
 
+@dataclass(frozen=True)
+class Sentinels:
+    """Known values the API must read back exactly.
+
+    The API check tests the read path only; the other predicates already prove
+    the writes. Sentinels rather than whatever the producer happens to have
+    written: two reads of a moving value disagree, which is the trap removed
+    from this test's output once already.
+    """
+
+    user: str
+    page: str
+    count: int
+    event_id: str
+
+    @classmethod
+    def for_run(cls, run_id: str) -> "Sentinels":
+        return cls(
+            user=f"sentinel-{run_id}",
+            page=f"/sentinel-{run_id}",
+            count=7,
+            event_id=f"sentinel-event-{run_id}",
+        )
+
+
+def _free_port() -> int:
+    """A port nothing is bound to at this moment.
+
+    Released before the API binds it, so something else could take it in
+    between. A small window, accepted here and said rather than hidden.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _write_sentinels(prefix: str, keyspace: str, sentinels: Sentinels) -> str:
+    """Put the known values in place. Returns an error string, or empty."""
+    try:
+        client = redis_store.connect()
+    except (OSError, redis_store.redis.RedisError) as error:
+        return f"could not connect to Redis for sentinels: {error}"
+    try:
+        client.set(redis_store.page_count_key(sentinels.page, prefix), sentinels.count)
+        client.set(redis_store.last_page_key(sentinels.user, prefix), sentinels.page)
+    except redis_store.redis.RedisError as error:
+        return f"could not write Redis sentinels: {error}"
+    finally:
+        client.close()
+
+    try:
+        cluster, session = cassandra_store.connect(keyspace=keyspace)
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return f"could not connect to Cassandra for sentinels: {error}"
+    try:
+        cassandra_store.record_pageview(
+            session,
+            cassandra_store.prepare_insert(session),
+            {
+                "user_id": sentinels.user,
+                "timestamp": time.time(),
+                "event_id": sentinels.event_id,
+                "page": sentinels.page,
+            },
+        )
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return f"could not write the Cassandra sentinel: {error}"
+    finally:
+        cluster.shutdown()
+    return ""
+
+
+API_ROUTES = {
+    "/health",
+    "/counts/pages",
+    "/users/{user_id}/last-page",
+    "/users/{user_id}/events",
+    "/cluster",
+}
+
+
+def _api_get(port: int, path: str) -> tuple[int | None, object, str]:
+    """Status and parsed body, or None and why the API could not be reached."""
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - a fixed localhost URL
+            f"http://127.0.0.1:{port}{path}", timeout=5
+        ) as response:
+            return response.status, json.loads(response.read()), ""
+    except urllib.error.HTTPError as error:
+        # A 404 or a 422 is an answer, and some checks want exactly that.
+        return error.code, json.loads(error.read() or b"null"), ""
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        return None, None, f"API on port {port} not answering: {error}"
+
+
+def _api_serves_the_stores(
+    port: int, sentinels: Sentinels, first_snapshot: dict
+) -> tuple[bool, str]:
+    """The API reads back each store's sentinel, and states each contract."""
+    status, body, error = _api_get(port, "/health")
+    if status != 200:
+        return False, error or f"/health answered {status}"
+
+    status, body, error = _api_get(
+        port, f"/counts/pages?page={urllib.parse.quote(sentinels.page)}"
+    )
+    counts = body.get("counts", {}) if isinstance(body, dict) else {}
+    if status != 200 or counts.get(sentinels.page) != sentinels.count:
+        return False, error or (
+            f"/counts/pages answered {status} with {counts.get(sentinels.page)!r} "
+            f"for {sentinels.page}, wanted {sentinels.count}"
+        )
+
+    status, body, error = _api_get(port, f"/users/{sentinels.user}/last-page")
+    page = body.get("page") if isinstance(body, dict) else None
+    if status != 200 or page != sentinels.page:
+        return False, error or f"last-page answered {status} with {page!r}"
+
+    status, _, error = _api_get(port, f"/users/nobody-{sentinels.user}/last-page")
+    if status != 404:
+        return False, error or f"an unknown user's last-page answered {status}"
+
+    status, body, error = _api_get(port, f"/users/{sentinels.user}/events")
+    events = body.get("events", []) if isinstance(body, dict) else []
+    ours = [event for event in events if event.get("event_id") == sentinels.event_id]
+    if status != 200 or not ours or not ours[0].get("written_at"):
+        return False, error or f"events answered {status} without the sentinel"
+
+    status, _, error = _api_get(port, f"/users/{sentinels.user}/events?limit=101")
+    if status != 422:
+        return False, error or f"limit=101 answered {status}, wanted 422"
+
+    status, body, error = _api_get(port, "/cluster")
+    if status != 200 or not isinstance(body, dict):
+        return False, error or f"/cluster answered {status}"
+    if not body.get("snapshot_matches_leader"):
+        return False, "/cluster: the snapshot does not match the leader yet"
+    seen = (body.get("leader") or {}).get("identity")
+    expected = (first_snapshot.get("leader") or {}).get("identity")
+    if seen != expected:
+        return False, f"/cluster reports leader {seen}, ZooKeeper said {expected}"
+
+    status, body, error = _api_get(port, "/openapi.json")
+    paths = set(body.get("paths", {})) if isinstance(body, dict) else set()
+    if status != 200 or paths != API_ROUTES:
+        return False, error or f"/openapi.json lists {sorted(paths)}"
+
+    return True, (
+        f"API on port {port} read back the Redis, Cassandra and ZooKeeper "
+        f"sentinels and states its 404 and 422 contracts"
+    )
+
+
 def honcho_topology_does_the_work() -> tuple[bool, str]:
     """Run the real Procfile topology and assert it does its job.
 
@@ -523,6 +681,8 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     keyspace = f"smoke_{run_id}"
     queue = f"smoke_jobs_{run_id}"
     root = f"/smoke_{run_id}"
+    api_port = _free_port()
+    sentinels = Sentinels.for_run(run_id)
 
     topology = Topology(
         os.environ
@@ -538,6 +698,9 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
             "CONSUMER_CRASH_AFTER": "",
             "WORKER_DELAY_SECONDS": "0.02",
             "SNAPSHOT_INTERVAL_SECONDS": "0.5",
+            # The server binds this port itself: the API runs inside the run's
+            # environment, reading its prefix, keyspace and root.
+            "API_PORT": str(api_port),
         }
     )
 
@@ -547,7 +710,7 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     first_snapshot: dict = {}
 
     try:
-        setup_error = _prepare_topology(topic, keyspace, root)
+        setup_error = _prepare_topology(topic, keyspace, root, prefix, sentinels)
         if setup_error:
             observed = (False, setup_error)
         else:
@@ -556,7 +719,15 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
             else:
                 started = True
                 observed = topology.wait_until_ready(
-                    _readiness(group, prefix, keyspace, queue, root, first_snapshot),
+                    _readiness(
+                        group,
+                        prefix,
+                        keyspace,
+                        queue,
+                        root,
+                        first_snapshot,
+                        api=(api_port, sentinels),
+                    ),
                     timeout=TOPOLOGY_SETTLE_SECONDS,
                 )
                 if observed[0]:
@@ -588,7 +759,9 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     return observed
 
 
-def _prepare_topology(topic: str, keyspace: str, root: str) -> str:
+def _prepare_topology(
+    topic: str, keyspace: str, root: str, prefix: str, sentinels: Sentinels
+) -> str:
     """Create everything the topology expects to already exist."""
     try:
         ensure_topic(topic, KAFKA_PARTITIONS, KAFKA_SERVER)
@@ -609,7 +782,7 @@ def _prepare_topology(topic: str, keyspace: str, root: str) -> str:
     finally:
         client.stop()
         client.close()
-    return ""
+    return _write_sentinels(prefix, keyspace, sentinels)
 
 
 def _readiness(
@@ -619,8 +792,18 @@ def _readiness(
     queue: str,
     root: str,
     first_snapshot: dict,
+    api: tuple[int, Sentinels] | None = None,
 ) -> list[tuple[str, object]]:
-    """Everything that must hold before the topology counts as working."""
+    """Everything that must hold before the topology counts as working.
+
+    The API goes last, so the leader it reports can be compared with the one
+    the ZooKeeper predicate saw in the same round.
+
+    The API's sentinels live under the same prefix and keyspace the consumers
+    write to, so the write predicates leave them out. Otherwise the sentinels
+    alone would satisfy them, and a consumer that wrote nothing would pass.
+    """
+    sentinels = api[1] if api is not None else None
 
     def kafka_group() -> tuple[bool, str]:
         members, error = _group_members(group)
@@ -653,6 +836,9 @@ def _readiness(
         counts, pages, error = _redis_state(prefix)
         if counts is None:
             return False, error
+        if sentinels is not None:
+            counts = {k: v for k, v in counts.items() if k != sentinels.page}
+            pages = {k: v for k, v in pages.items() if k != sentinels.user}
         if not counts:
             return False, f"no {prefix}pageviews:* counters"
         if not pages:
@@ -663,6 +849,9 @@ def _readiness(
         rows, error = _cassandra_rows(keyspace)
         if rows is None:
             return False, error
+        if sentinels is not None:
+            # At most one sentinel row, so LIMIT 5 still reaches consumer rows.
+            rows = [row for row in rows if row.user_id != sentinels.user]
         if not rows:
             return False, f"no rows in {keyspace}"
         missing = [
@@ -732,7 +921,7 @@ def _readiness(
             f"{len(state['workers'])} workers registered"
         )
 
-    return [
+    predicates = [
         ("kafka group", kafka_group),
         ("offsets", offsets_advance),
         ("redis", redis_branches),
@@ -740,6 +929,12 @@ def _readiness(
         ("rabbitmq", rabbit_workers),
         ("zookeeper", one_leader),
     ]
+    if api is not None:
+        port = api[0]
+        predicates.append(
+            ("api", lambda: _api_serves_the_stores(port, sentinels, first_snapshot))
+        )
+    return predicates
 
 
 def _live_config_reaches_workers(root: str) -> tuple[bool, str]:

@@ -37,6 +37,13 @@ class FakeRedis:
         prefix = match.rstrip("*") if match else ""
         return [key for key in list(self.store) if key.startswith(prefix)]
 
+    def scan(self, cursor=0, match=None, count=None):
+        # One page, cursor 0: a complete sweep in a single call.
+        return 0, self.scan_iter(match=match, count=count)
+
+    def mget(self, keys):
+        return [self.store.get(key) for key in keys]
+
     def close(self):
         pass
 

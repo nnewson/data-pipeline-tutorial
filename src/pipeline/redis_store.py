@@ -7,6 +7,8 @@ Same handler, same replay, two outcomes.
 """
 
 import logging
+from collections.abc import Iterator, Sequence
+from typing import Any
 
 import redis
 
@@ -28,17 +30,24 @@ def last_page_key(user_id: str, prefix: str = REDIS_KEY_PREFIX) -> str:
     return f"{prefix}{LAST_PAGE_PREFIX}{user_id}"
 
 
-def connect(host: str = REDIS_HOST, port: int = REDIS_PORT) -> redis.Redis:
+def connect(
+    host: str = REDIS_HOST, port: int = REDIS_PORT, retries: int = 10, **options: Any
+) -> redis.Redis:
     """Return a Redis client that has actually reached the server.
 
     `redis.Redis(...)` connects lazily, so constructing one succeeds with
     nothing listening. Without the PING, wait_for_connection would report a
     connection it has not made, and the failure would surface later somewhere
     less obvious.
+
+    `options` go straight to the client. The pipeline's writers pass none and
+    run on redis-py's defaults; the API passes its own timeouts and retry
+    policy, because those defaults were measured taking about a minute to fail
+    one command against a paused server.
     """
 
     def open_client() -> redis.Redis:
-        client = redis.Redis(host=host, port=port, decode_responses=True)
+        client = redis.Redis(host=host, port=port, decode_responses=True, **options)
         try:
             client.ping()
         except (redis.RedisError, OSError):
@@ -48,7 +57,7 @@ def connect(host: str = REDIS_HOST, port: int = REDIS_PORT) -> redis.Redis:
             raise
         return client
 
-    return wait_for_connection("Redis", open_client)
+    return wait_for_connection("Redis", open_client, retries=retries)
 
 
 def record_pageview(
@@ -65,34 +74,72 @@ def record_pageview(
     client.set(last_page_key(event["user_id"], prefix), event["page"])
 
 
-def page_counts(client: redis.Redis, prefix: str = REDIS_KEY_PREFIX) -> dict[str, int]:
-    """Every page counter under the prefix.
+def _scan_values(client: redis.Redis, pattern: str) -> Iterator[tuple[str, str]]:
+    """Every (key, value) whose key matches pattern and which still has a value.
 
     SCAN rather than KEYS: KEYS blocks the server for the whole sweep, which is
-    a habit worth not forming even where the keyspace is tiny.
+    a habit worth not forming even where the keyspace is tiny. Then one MGET per
+    page of keys rather than a GET per key.
+
+    Still a sweep of the *whole* keyspace: SCAN visits every key and filters
+    afterwards, and there is one last-page key per user. Fine for a CLI and a
+    snapshot; not something to put behind an HTTP route.
     """
-    pattern = f"{prefix}{PAGE_COUNT_PREFIX}*"
-    counts: dict[str, int] = {}
-    for key in client.scan_iter(match=pattern, count=100):
-        value = client.get(key)
-        if value is None:
-            continue
-        page = key[len(f"{prefix}{PAGE_COUNT_PREFIX}") :]
-        counts[page] = int(value)
-    return counts
+    cursor = 0
+    while True:
+        cursor, keys = client.scan(cursor=cursor, match=pattern, count=100)
+        if keys:
+            values = client.mget(keys)
+            for key, value in zip(keys, values, strict=True):
+                # A key can expire or be deleted between the SCAN and the MGET.
+                if value is not None:
+                    yield key, value
+        if cursor == 0:
+            return
+
+
+def page_counts(client: redis.Redis, prefix: str = REDIS_KEY_PREFIX) -> dict[str, int]:
+    """Every page counter under the prefix, found by sweeping the keyspace."""
+    start = len(f"{prefix}{PAGE_COUNT_PREFIX}")
+    return {
+        key[start:]: int(value)
+        for key, value in _scan_values(client, f"{prefix}{PAGE_COUNT_PREFIX}*")
+    }
+
+
+def page_counts_for(
+    client: redis.Redis, pages: Sequence[str], prefix: str = REDIS_KEY_PREFIX
+) -> dict[str, int]:
+    """The counters for exactly these pages, in one MGET.
+
+    One command however many users there are, where discovering every page
+    means sweeping every key. A page with no counter is left out rather than
+    reported as zero: Redis holds nothing for it, and this is a volatile view.
+    """
+    if not pages:
+        return {}
+    values = client.mget([page_count_key(page, prefix) for page in pages])
+    return {
+        page: int(value)
+        for page, value in zip(pages, values, strict=True)
+        if value is not None
+    }
 
 
 def last_pages(client: redis.Redis, prefix: str = REDIS_KEY_PREFIX) -> dict[str, str]:
     """Every last-page value under the prefix."""
-    pattern = f"{prefix}{LAST_PAGE_PREFIX}*"
-    pages: dict[str, str] = {}
-    for key in client.scan_iter(match=pattern, count=100):
-        value = client.get(key)
-        if value is None:
-            continue
-        user = key[len(f"{prefix}{LAST_PAGE_PREFIX}") :]
-        pages[user] = value
-    return pages
+    start = len(f"{prefix}{LAST_PAGE_PREFIX}")
+    return {
+        key[start:]: value
+        for key, value in _scan_values(client, f"{prefix}{LAST_PAGE_PREFIX}*")
+    }
+
+
+def last_page(
+    client: redis.Redis, user_id: str, prefix: str = REDIS_KEY_PREFIX
+) -> str | None:
+    """One user's last page, or None when Redis holds no value for them."""
+    return client.get(last_page_key(user_id, prefix))
 
 
 def clear(client: redis.Redis, prefix: str) -> int:

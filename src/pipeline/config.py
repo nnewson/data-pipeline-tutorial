@@ -85,3 +85,9 @@ ZOOKEEPER_TIMEOUT_SECONDS = float(os.environ.get("ZOOKEEPER_TIMEOUT_SECONDS", "1
 
 # How often the leader writes a snapshot.
 SNAPSHOT_INTERVAL_SECONDS = float(os.environ.get("SNAPSHOT_INTERVAL_SECONDS", "2"))
+
+# The API is a host process like everything else in the Procfile, so it has one
+# address: this port on localhost. There is no container-facing address because
+# no container is a client of it. Overridable so a test run can bind a port of
+# its own.
+API_PORT = int(os.environ.get("API_PORT", "8000"))

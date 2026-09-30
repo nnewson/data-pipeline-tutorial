@@ -16,6 +16,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from kazoo.client import KazooClient
 from kazoo.exceptions import BadVersionError, NodeExistsError, NoNodeError
@@ -23,6 +24,9 @@ from kazoo.protocol.states import KazooState
 
 from pipeline import wait_for_connection
 from pipeline.config import ZOOKEEPER_HOSTS, ZOOKEEPER_ROOT, ZOOKEEPER_TIMEOUT_SECONDS
+
+if TYPE_CHECKING:
+    from pipeline.bulkhead import Budget
 
 logger = logging.getLogger("coordination")
 
@@ -87,7 +91,7 @@ class Paths:
         ]
 
 
-def connect(hosts: str = ZOOKEEPER_HOSTS) -> KazooClient:
+def connect(hosts: str = ZOOKEEPER_HOSTS, retries: int = 10) -> KazooClient:
     """Start a client, retrying while ZooKeeper is still coming up."""
 
     def start() -> KazooClient:
@@ -100,7 +104,7 @@ def connect(hosts: str = ZOOKEEPER_HOSTS) -> KazooClient:
             raise
         return client
 
-    return wait_for_connection("ZooKeeper", start)
+    return wait_for_connection("ZooKeeper", start, retries=retries)
 
 
 def negotiated_timeout(client: KazooClient) -> float:
@@ -221,9 +225,38 @@ def write_snapshot(
             raise result
 
 
-def read_snapshot(client: KazooClient, paths: Paths) -> tuple[dict, int]:
+def _read(client: KazooClient, budget: "Budget | None", method: str, *args: Any) -> Any:
+    """One kazoo read: plain and synchronous, or bounded by a budget.
+
+    Without a budget this is the call every caller has made since 0.7, which
+    waits as long as it takes. With one, the request is sent asynchronously and
+    waited for with a timeout — because kazoo's synchronous calls take none.
+
+    **A timeout ends the wait, not the request.** kazoo keeps the request queued
+    on its one connection, so on a timeout it is handed to the budget, whose
+    admission it keeps until kazoo completes it. Measured against a paused
+    server, releasing admission at the timeout instead let abandoned reads pile
+    up for the whole pause — and hid the pause from kazoo itself, because it
+    counts every request sent as a heartbeat whether or not a reply comes back.
+    """
+    if budget is None:
+        return getattr(client, method)(*args)
+    # Before sending: a spent budget sends nothing, so there is nothing to hand
+    # over.
+    timeout = budget.call_timeout()
+    result = getattr(client, f"{method}_async")(*args)
+    try:
+        return result.get(timeout=timeout)
+    except client.handler.timeout_exception:
+        budget.abandon(result)
+        raise
+
+
+def read_snapshot(
+    client: KazooClient, paths: Paths, budget: "Budget | None" = None
+) -> tuple[dict, int]:
     """The snapshot and its znode version, so a caller can prove it advanced."""
-    value, stat = client.get(paths.snapshot)
+    value, stat = _read(client, budget, "get", paths.snapshot)
     return json.loads(value or b"{}"), stat.version
 
 
@@ -291,9 +324,11 @@ def release_leadership(
         pass
 
 
-def read_leader(client: KazooClient, paths: Paths) -> dict | None:
+def read_leader(
+    client: KazooClient, paths: Paths, budget: "Budget | None" = None
+) -> dict | None:
     try:
-        value, _ = client.get(paths.leader)
+        value, _ = _read(client, budget, "get", paths.leader)
     except NoNodeError:
         return None
     return json.loads(value) if value else None
@@ -328,15 +363,17 @@ def update_registration(client: KazooClient, path: str, extra: dict) -> None:
     client.set(path, json.dumps(payload).encode())
 
 
-def registrations(client: KazooClient, paths: Paths, role: str) -> list[dict]:
+def registrations(
+    client: KazooClient, paths: Paths, role: str, budget: "Budget | None" = None
+) -> list[dict]:
     """Every current registration for a role."""
     base = f"{paths.registry}/{role}"
-    if not client.exists(base):
+    if not _read(client, budget, "exists", base):
         return []
     found = []
-    for child in client.get_children(base):
+    for child in _read(client, budget, "get_children", base):
         try:
-            value, _ = client.get(f"{base}/{child}")
+            value, _ = _read(client, budget, "get", f"{base}/{child}")
         except NoNodeError:
             continue
         if value:
