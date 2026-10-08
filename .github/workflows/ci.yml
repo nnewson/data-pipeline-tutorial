@@ -52,8 +52,11 @@ jobs:
         with:
           node-version: "24"
 
+      # A glob, quoted so Node expands it rather than the shell. Given a bare
+      # directory, Node 26 searches it for tests but Node 24 tries to load it
+      # as a module and fails with MODULE_NOT_FOUND (measured on both).
       - name: JavaScript tests
-        run: node --test tests/js/
+        run: node --test "tests/js/*.test.mjs"
 
       - name: Validate Compose file
         run: docker compose config --quiet

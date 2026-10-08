@@ -1159,7 +1159,7 @@ seconds is a refresh schedule, not a freshness guarantee: during an outage every
 read fails, and the last-read time is the honest signal.
 
 The tracker and that scheduler are JavaScript, and they are the release's
-central claims, so they have tests of their own — `node --test tests/js/`,
+central claims, so they have tests of their own — `node --test "tests/js/*.test.mjs"`,
 against the very module the page imports. The decisive one suppresses the final
 notification without disconnecting anything, and requires the counts to catch
 up through the periodic read alone.
@@ -1415,7 +1415,7 @@ Unit tests need no broker.
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest
-node --test tests/js/
+node --test "tests/js/*.test.mjs"
 ```
 
 The last one is a separate step, in CI too, rather than something `pytest`

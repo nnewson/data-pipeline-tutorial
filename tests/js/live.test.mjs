@@ -1,6 +1,6 @@
 // The live page's claims, tested against the module the page itself imports.
 //
-//   node --test tests/js/
+//   node --test "tests/js/*.test.mjs"
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
