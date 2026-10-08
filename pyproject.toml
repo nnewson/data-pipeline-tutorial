@@ -7,7 +7,7 @@ module-name = "pipeline"
 
 [project]
 name = "data-pipeline-tutorial"
-version = "0.8"
+version = "0.9"
 description = "A step-by-step rebuild of a Kafka, Redis, Cassandra, RabbitMQ, ZooKeeper, Flink and gRPC pipeline"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -21,6 +21,7 @@ dependencies = [
   "kazoo",           # ZooKeeper client
   "fastapi",         # HTTP API over the stores
   "uvicorn",         # ASGI server for the API, run as a single process
+  "websockets",      # WebSocket support for uvicorn, and the smoke test's client
 ]
 
 [project.optional-dependencies]

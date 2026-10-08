@@ -10,6 +10,7 @@ from pipeline import (
     cassandra_store,
     coordination,
     jobs_queue,
+    notifications,
     wait_for_connection,
     wait_for_topic,
 )
@@ -54,7 +55,7 @@ def connect() -> KafkaConsumer:
     )
 
 
-def handle(message, redis_client, session, insert, channel) -> None:
+def handle(message, redis_client, session, insert, channel, notifier=None) -> None:
     """The work: apply one event to both stores, then log what happened.
 
     All of this runs before the offset is committed, which is what makes a
@@ -65,12 +66,19 @@ def handle(message, redis_client, session, insert, channel) -> None:
     Four writes now, still not atomic together. The window between the publish
     and the commit is the one that matters most: a crash there means the job
     runs, and then runs again after the replay.
+
+    Then a notification, last and best-effort. Last, so a page that reads state
+    when it hears one reads the state it was told about. Before the commit, so a
+    replay publishes it again — the same position, and the same replay
+    behaviour, as every other write here.
     """
     record_pageview(redis_client, message.value)
     cassandra_store.record_pageview(session, insert, message.value)
     # Raises if the publish is not confirmed as routed, so the offset below is
     # not committed and the event is redelivered.
     jobs_queue.publish(channel, message.value)
+    if notifier is not None:
+        notifier.announce(message.value, message.partition, message.offset)
     logger.info(
         f"Consumed (partition {message.partition}, offset {message.offset}): "
         f"{message.value}"
@@ -85,10 +93,11 @@ def consume_forever(
     channel,
     commit_every: int = COMMIT_EVERY,
     crash_after: int | None = CONSUMER_CRASH_AFTER,
+    notifier: notifications.Notifier | None = None,
 ) -> None:
     processed = 0
     for message in consumer:
-        handle(message, redis_client, session, insert, channel)
+        handle(message, redis_client, session, insert, channel, notifier)
         processed += 1
 
         # The work happened before the commit, so a crash here replays it.
@@ -120,6 +129,12 @@ def main() -> int:
         redis_client = connect_redis()
         resources.callback(redis_client.close)
 
+        # A second client for notifications only, with short timeouts and no
+        # retries; the writes above keep redis-py's defaults.
+        notify_client = connect_redis(**notifications.CLIENT_OPTIONS)
+        resources.callback(notify_client.close)
+        notifier = notifications.Notifier(notify_client)
+
         cluster, session = cassandra_store.connect(keyspace=CASSANDRA_KEYSPACE)
         resources.callback(cluster.shutdown)
 
@@ -147,7 +162,9 @@ def main() -> int:
         resources.callback(consumer.close)
 
         try:
-            consume_forever(consumer, redis_client, session, insert, channel)
+            consume_forever(
+                consumer, redis_client, session, insert, channel, notifier=notifier
+            )
         except KeyboardInterrupt:
             logger.info("Shutting down consumer")
     return 0

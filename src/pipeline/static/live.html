@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pipeline, live</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fbfbf9; --fg: #1d1d1b; --muted: #6b6b66; --line: #e3e2dc;
+      --ok: #2f7d4f; --warn: #a15c00; --bad: #b3261e;
+      font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #161615; --fg: #ecebe6; --muted: #9a9993; --line: #2c2c2a;
+              --ok: #6fc28f; --warn: #e0a24a; --bad: #f08a80; }
+    }
+    body { margin: 0; background: var(--bg); color: var(--fg); }
+    main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 15px; margin: 28px 0 8px; color: var(--muted); font-weight: 600; }
+    p.lede { margin: 0 0 16px; color: var(--muted); }
+    .status { display: flex; gap: 16px; flex-wrap: wrap; }
+    .pill { padding: 2px 10px; border: 1px solid var(--line); border-radius: 999px; }
+    .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 500; }
+    td.n { text-align: right; font-variant-numeric: tabular-nums; }
+    ol { list-style: none; margin: 0; padding: 0; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    li { padding: 2px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+    .mark { margin-left: 8px; }
+    .small { font-size: 13px; color: var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Pipeline, live</h1>
+  <p class="lede">
+    Notifications make this page responsive; reading the counts again keeps it
+    correct. Redis delivers each notification at most once and keeps nothing, so
+    this page can miss some — the offsets below reveal some of those gaps, never
+    all of them.
+  </p>
+
+  <div class="status">
+    <span class="pill">socket: <span id="socket">connecting</span></span>
+    <span class="pill">subscription: <span id="bridge">unknown</span></span>
+  </div>
+
+  <h2>Page counts</h2>
+  <table>
+    <thead><tr><th>page</th><th class="n">views</th></tr></thead>
+    <tbody id="counts"></tbody>
+  </table>
+  <p class="small">Last successful read: <span id="read-at">never</span>
+    <span id="read-error" class="bad"></span></p>
+  <p class="small">Replay-sensitive, as <code>/counts/pages</code> says. Read
+    after notifications (at most once a second), after any reconnection, and
+    every 30 seconds — a refresh schedule, not a freshness guarantee.</p>
+
+  <h2>Notifications</h2>
+  <p class="small">Per partition: <em>unseen</em> marks offsets this page has
+    not received (some may still arrive late); <em>previously observed</em> is a
+    replay of one it did receive; <em>older offset</em> is below the highest seen
+    but not one it remembers. The first and the last losses can never show.</p>
+  <ol id="feed"></ol>
+
+  <h2>Subscription notices</h2>
+  <ol id="notices"></ol>
+</main>
+
+<script type="module">
+  import { createScheduler, createTracker } from "./live.mjs";
+
+  const FEED_LENGTH = 50;
+  const element = (id) => document.getElementById(id);
+
+  // One tracker for the whole page session, so a reconnect is not a new
+  // baseline: the gap it caused stays visible.
+  const tracker = createTracker();
+
+  const scheduler = createScheduler({
+    read: async () => {
+      const response = await fetch("/counts/pages", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return (await response.json()).counts;
+    },
+    onResult: (result) => {
+      if (result.ok) {
+        renderCounts(result.value);
+        element("read-at").textContent = new Date(result.at).toLocaleTimeString();
+        element("read-error").textContent = "";
+      } else {
+        element("read-error").textContent = ` — the last read failed (${result.error.message}); retrying`;
+      }
+    },
+  });
+
+  // Every field came from Redis, which anyone with access can publish to, so
+  // nothing is ever interpolated as HTML: textContent only.
+  function renderCounts(counts) {
+    const rows = Object.entries(counts).sort(([a], [b]) => a.localeCompare(b));
+    element("counts").replaceChildren(...rows.map(([page, views]) => {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      const value = document.createElement("td");
+      name.textContent = page;
+      value.textContent = String(views);
+      value.className = "n";
+      row.append(name, value);
+      return row;
+    }));
+  }
+
+  const LABELS = {
+    first: ["baseline", "small"],
+    next: ["", ""],
+    gap: ["unseen", "warn"],
+    repeat: ["previously observed", "warn"],
+    older: ["older offset", "small"],
+  };
+
+  function addEvent(message, seen) {
+    const item = document.createElement("li");
+    item.textContent =
+      `p${message.partition} @${message.offset}  ${message.user_id}  ${message.page}`;
+    const [label, style] = LABELS[seen.kind];
+    if (label) {
+      const mark = document.createElement("span");
+      mark.className = `mark ${style}`;
+      mark.textContent = seen.unseen
+        ? `${label} ${seen.unseen.from}–${seen.unseen.to}`
+        : label;
+      item.append(mark);
+    }
+    const feed = element("feed");
+    feed.prepend(item);
+    while (feed.children.length > FEED_LENGTH) feed.lastElementChild.remove();
+  }
+
+  function addNotice(text) {
+    const item = document.createElement("li");
+    item.textContent = text;
+    element("notices").prepend(item);
+  }
+
+  function setBridge(state) {
+    const node = element("bridge");
+    node.textContent = state;
+    node.className = state === "subscribed" ? "ok" : "warn";
+  }
+
+  let started = false;
+  let attempt = 0;
+
+  function connect() {
+    element("socket").textContent = "connecting";
+    const socket = new WebSocket(`ws://${location.host}/ws/pageviews`);
+    socket.onmessage = (event) => handle(JSON.parse(event.data));
+    socket.onclose = (event) => {
+      // A refused handshake and a dropped socket look alike from here (often
+      // 1006), so every failure gets the same answer: back off and retry.
+      const delay = Math.min(10000, 500 * 2 ** attempt);
+      attempt += 1;
+      element("socket").textContent = `reconnecting in ${delay / 1000}s (code ${event.code})`;
+      element("socket").className = "warn";
+      setBridge("unknown");
+      setTimeout(connect, delay);
+    };
+  }
+
+  function handle(message) {
+    switch (message.type) {
+      case "ready":
+        attempt = 0;
+        element("socket").textContent = "connected";
+        element("socket").className = "ok";
+        setBridge(message.bridge);
+        // Enrolled first, then read: nothing can change between the read and
+        // the subscription unnoticed.
+        if (!started) {
+          started = true;
+          if (!document.hidden) scheduler.start();
+        } else {
+          scheduler.request();
+        }
+        break;
+      case "pageview":
+        addEvent(message, tracker.observe(message.partition, message.offset));
+        scheduler.request();
+        break;
+      case "interrupted":
+        setBridge("interrupted");
+        addNotice(`interrupted — detected at ${message.detected_at}`);
+        break;
+      case "resubscribed":
+        setBridge("subscribed");
+        addNotice(`resubscribed at ${message.resubscribed_at} (interruption detected at ${message.detected_at})`);
+        scheduler.request(); // even though this socket stayed open
+        break;
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!started) return;
+    if (document.hidden) scheduler.stop();
+    else scheduler.start();
+  });
+
+  connect();
+</script>
+</body>
+</html>

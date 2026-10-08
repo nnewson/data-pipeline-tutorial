@@ -9,8 +9,13 @@ visible rather than retrying until it looks tidy.
 One endpoint, one store. No writes, no fan-out reads, no cache.
 """
 
+import asyncio
+import contextlib
+import importlib.resources
+import json
 import logging
-from contextlib import ExitStack, asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
@@ -21,8 +26,8 @@ import uvicorn
 from cassandra import OperationTimedOut, RequestExecutionException
 from cassandra.cluster import NoHostAvailable, Session
 from cassandra.connection import ConnectionException
-from fastapi import FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from kazoo.client import KazooClient
 from kazoo.exceptions import (
     ConnectionClosedError,
@@ -35,12 +40,16 @@ from pydantic import BaseModel, Field, StringConstraints
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
-from pipeline import cassandra_store, coordination, redis_store
+from pipeline import cassandra_store, coordination, fanout, notifications, redis_store
+from pipeline.bridge import Bridge
+from pipeline.bridge import open_client as open_subscription_client
 from pipeline.bulkhead import Budget, Bulkhead, Busy, Unavailable
 from pipeline.config import (
     API_PORT,
     CASSANDRA_KEYSPACE,
+    REDIS_HOST,
     REDIS_KEY_PREFIX,
+    REDIS_PORT,
     ZOOKEEPER_ROOT,
 )
 from pipeline.coordination import ROLES, Paths
@@ -386,10 +395,63 @@ def event_response(row) -> Event:
     )
 
 
+# --- Live notifications ---------------------------------------------------------
+
+
+@dataclass
+class Live:
+    """The one subscription and its fan-out, held for the life of the process."""
+
+    hub: fanout.Hub
+    bridge: Bridge
+    origins: frozenset[str]
+
+
+def allowed_origins(port: int = API_PORT) -> frozenset[str]:
+    """The API's own origins, exactly: scheme, host and port."""
+    return frozenset({f"http://localhost:{port}", f"http://127.0.0.1:{port}"})
+
+
+def origin_allowed(origin: str | None, allowed: frozenset[str]) -> bool:
+    """Refuse a missing or `null` origin as well as a foreign one.
+
+    WebSockets are not covered by CORS, so without this any page open in the
+    same browser could read the stream — and binding to 127.0.0.1 does not help,
+    because the browser is on 127.0.0.1 too. It protects against browsers only:
+    any other client can forge the header.
+    """
+    return origin is not None and origin in allowed
+
+
+@asynccontextmanager
+async def open_live(prefix: str) -> AsyncIterator[Live]:
+    hub = fanout.Hub()
+    client = open_subscription_client(REDIS_HOST, REDIS_PORT)
+    bridge = Bridge(
+        client.pubsub, notifications.channel(prefix), hub.broadcast, hub.notice
+    )
+    task = asyncio.create_task(bridge.run())
+    try:
+        yield Live(hub=hub, bridge=bridge, origins=allowed_origins())
+    finally:
+        # The subscription stops before its client closes.
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await client.aclose()
+
+
+def _static(name: str) -> str:
+    return (importlib.resources.files("pipeline") / "static" / name).read_text()
+
+
 # --- The application ------------------------------------------------------------
 
 
-def create_app(open_stores=open_stores) -> FastAPI:
+def create_app(
+    open_stores=open_stores,
+    open_live: Callable[[str], AbstractAsyncContextManager[Live]] = open_live,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         with ExitStack() as stack:
@@ -398,11 +460,15 @@ def create_app(open_stores=open_stores) -> FastAPI:
             stores = await anyio.to_thread.run_sync(open_stores, stack)
             app.state.stores = stores
             app.state.bulkheads = make_bulkheads(stores)
-            yield
+            async with open_live(stores.prefix) as live:
+                app.state.live = live
+                yield
+
+    page, module = _static("live.html"), _static("live.mjs")
 
     app = FastAPI(
         title="data-pipeline-tutorial",
-        version="0.8",
+        version="0.9",
         summary="Three stores, three kinds of truth.",
         lifespan=lifespan,
     )
@@ -504,6 +570,36 @@ def create_app(open_stores=open_stores) -> FastAPI:
         )
         return cluster_response(state_)
 
+    # The page is not part of the API's contract, so it is left out of OpenAPI —
+    # which has no way to describe the WebSocket in any case.
+    @app.get("/live", include_in_schema=False)
+    async def live_page() -> HTMLResponse:
+        return HTMLResponse(page)
+
+    @app.get("/live.mjs", include_in_schema=False)
+    async def live_module() -> Response:
+        return Response(module, media_type="text/javascript")
+
+    @app.websocket("/ws/pageviews")
+    async def pageviews(websocket: WebSocket) -> None:
+        live: Live = websocket.app.state.live
+        # Both refusals come before accept, so they are HTTP rejections. No close
+        # code reaches a browser from here; it may report 1006, and the page
+        # treats every failure to connect alike.
+        if not origin_allowed(websocket.headers.get("origin"), live.origins):
+            await websocket.close()
+            return
+        if not live.hub.admit():
+            await websocket.close()
+            return
+        try:
+            await websocket.accept()
+            ready = json.dumps({"type": "ready", "bridge": live.bridge.state})
+            await fanout.attend(live.hub, websocket, ready)
+        finally:
+            # Only after attend() has cleaned up, evicted sockets included.
+            live.hub.release()
+
     return app
 
 
@@ -531,7 +627,7 @@ def main() -> None:
         # exited before the lifespan ever ran. After 0.3's leak history, a
         # supervisor inside a supervised process is the last thing wanted here.
         uvicorn.run(
-            create_app(open_stores=hand_over),
+            create_app(open_stores=hand_over, open_live=open_live),
             host="127.0.0.1",
             port=API_PORT,
             workers=1,

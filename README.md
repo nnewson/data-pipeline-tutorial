@@ -4,19 +4,18 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.8 — FastAPI.** The pipeline becomes visible without a CLI:
-an HTTP API over Redis, Cassandra and ZooKeeper, one endpoint per store. Each
-store answers a different question with different freshness and consistency
-properties, and an API is where a system either states those properties or
-quietly averages them away. This one states only what each source can prove —
-and, when a store freezes, answers within a bound it can also state.
+**This release: 0.9 — WebSockets and Redis pub/sub.** Push instead of poll,
+and the third messaging pattern: a live page that updates as events are applied.
+Redis pub/sub keeps nothing and acknowledges nothing, so the page treats every
+notification as a hint, reads the state it points at, and uses Kafka's offsets to
+notice some of what it missed — never all of it.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.8
+git checkout 0.9
 ```
 
 ## Prerequisites
@@ -24,6 +23,7 @@ git checkout 0.8
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
 - Docker and Docker Compose
+- Node, for the live page's JavaScript tests only
 
 ## Setup
 
@@ -427,7 +427,8 @@ ambiguous, and telling the two apart is the whole lesson.
 
 ## Four writes, four behaviours
 
-The handler now performs four writes before committing its offset:
+The handler performs four writes before committing its offset — and, since 0.9,
+a best-effort notification after them:
 
 | write | after a replay |
 |---|---|
@@ -435,6 +436,7 @@ The handler now performs four writes before committing its offset:
 | `SET` (Redis) | converges — the value is right |
 | `INSERT` (Cassandra) | replaces — the row is right |
 | **publish (RabbitMQ)** | **re-runs — the work happens twice** |
+| `PUBLISH` (Redis, 0.9) | a new publication of the same event — and a subscriber that was away hears neither |
 
 The first three are about stored state. The fourth is not: a duplicate job is a
 side effect that *executes* again. If it sent an email or charged a card, "the
@@ -1052,6 +1054,193 @@ no `--workers`, which adds children. After 0.3's leak history, a supervisor
 inside a supervised process is the last thing this topology needs. Once
 serving, it starts in about 0.4s and exits about 0.2s after SIGTERM.
 
+## Live: notifications, not state
+
+```bash
+uv run honcho start
+open http://localhost:8000/live
+```
+
+The page updates without a refresh. Each consumer, once it has applied an event,
+announces it on a Redis channel; the API holds **one** subscription and fans it
+out to every open page over a WebSocket at `ws://localhost:8000/ws/pageviews`.
+
+That makes pub/sub the third messaging pattern in the series, and the same verb
+with opposite guarantees:
+
+| | Kafka (0.2–0.3) | RabbitMQ (0.6) | Redis pub/sub (0.9) |
+|---|---|---|---|
+| shape | log | queue | broadcast |
+| who gets a message | one consumer per partition, per group | one competing worker | every current subscriber |
+| a subscriber that was away | resumes from its offset | finds the work waiting | has missed it |
+| per-publication delivery | durable, replayable | at-least-once (redelivery) | **at-most-once** |
+| what publishing returns | a broker ack | a publisher confirm | **how many subscribers were listening** |
+
+`PUBLISH` returns an integer and keeps nothing. With the API stopped it returns
+0 — measured with `PUBSUB NUMSUB` while the API was down — and that is normal,
+not an error: nobody was listening, so nobody was told.
+
+So the page treats a notification as a **hint that something changed**, never as
+the state itself. It reads `/counts/pages` when it hears one, and the
+notification carries no count: four consumers publish concurrently, so values
+for one page could arrive out of order, and a Redis restart resets every counter
+anyway. 0.4's lesson in a new place — announce that something changed, and let
+the reader fetch the value.
+
+Two levels of delivery, kept apart as 0.6 kept RabbitMQ's redelivery apart from
+upstream republication:
+
+- **Per publication, per subscriber: at most once.** Redis's own contract.
+- **Per event: zero, one or several times**, because a Kafka replay applies an
+  event again and publishes it again.
+
+The publish is the handler's last write, so a page that reads state when it
+hears one reads the state it was told about — and it is **best-effort**. An
+*unconfirmed* publish is logged once and swallowed — unconfirmed rather than
+failed, because after a timeout the `PUBLISH` may have happened and only its
+reply been lost. Failing the handler instead would leave the offset uncommitted,
+and the replay would run the `INCR` again, so a lost notification would corrupt
+a counter. *A write whose loss is harmless must not
+cause a replay that is not.* It also has a client of its own, with half-second
+timeouts and no retries, because the consumer's other writes keep redis-py's
+defaults and those took a minute to fail at 0.8. Measured: 264µs per event warm
+(the `INCR` and `SET` before it take 573µs); 0.5s per event against a paused
+Redis; and 2.26s for one cold notification against a Redis answering just inside
+the timeout, because a fresh connection is five exchanges, not one.
+
+## What the offsets can and cannot prove
+
+Each notification carries its event's Kafka **partition and offset** — metadata
+the pipeline genuinely owns. For this topic a partition's offsets are contiguous
+(checked: every partition from 0, no gaps), so the page can notice some of what
+it missed. Its tracker, per partition:
+
+| it sees | it reports |
+|---|---|
+| the first offset | a baseline — not evidence of anything |
+| the next one | nothing |
+| a jump past the highest seen | the **unseen range** — not a count of losses, since some may still arrive late |
+| an offset it remembers | **previously observed**: a replay published it again |
+| an offset below the highest, not remembered | **older offset** — late, or a rewind, not a proven repeat |
+
+The highest offset seen never moves backwards (received as `8, 10, 9`, the 9 is
+late, not a duplicate), the memory of recent offsets is bounded, and the tracker
+lives for the whole page session, so a reconnect is not a new baseline. What it
+can never show: the **first** notification lost, the **last** one lost, and
+anything across a recreated topic.
+
+The tracker does arithmetic on partitions and offsets, so the bridge relays only
+values from 0 to 2^53 − 1 — the largest integer JavaScript represents exactly;
+above it a browser reads a JSON number as an approximation, or as `Infinity`,
+and one such offset would poison a partition's high-water mark. That is **this
+notification format's limit, not Kafka's**: Kafka offsets are 64-bit and can
+exceed it, and carrying them would take another representation, such as decimal
+strings.
+
+Measured against the real pipeline:
+
+- **A consumer crash.** Forty events, a consumer crashing with five uncommitted,
+  then a second consumer: 45 notifications for 40 distinct events, and the
+  tracker marked exactly **5 previously observed** — 0.3's replay, seen live.
+- **The API restarted** for eight seconds with the topology running: no
+  subscribers on the channel meanwhile, and on reconnect the tracker marked the
+  unseen ranges per partition — `p0 167–170`, `p1 141–142`, `p2 101–102`, eight
+  offsets for about eight events.
+- **The subscription killed** with `redis-cli CLIENT KILL TYPE pubsub`, and
+  **Redis restarted**: the tracker's unseen range matched the offsets actually
+  never received, exactly, both times.
+
+Notifications make the page responsive; **reconciliation** keeps it correct. A
+lost *last* notification shows in no offset, so the page also reads its counts
+after every reconnection, after every `resubscribed` notice, and every thirty
+seconds while it is visible — one read at a time, throttled to one a second,
+retried with backoff — and shows the time of its last successful read. Thirty
+seconds is a refresh schedule, not a freshness guarantee: during an outage every
+read fails, and the last-read time is the honest signal.
+
+The tracker and that scheduler are JavaScript, and they are the release's
+central claims, so they have tests of their own — `node --test "tests/js/*.test.mjs"`,
+against the very module the page imports. The decisive one suppresses the final
+notification without disconnecting anything, and requires the counts to catch
+up through the periodic read alone.
+
+## One subscription, and what it can prove about itself
+
+The API's subscription is one `redis.asyncio` task, not a thread: a thread would
+hand every message to the event loop through an unbounded queue of callbacks. In
+one task nothing in the application grows without bound — if fan-out fell behind,
+reads would slow, Redis would buffer on its side, and its own limit for pub/sub
+clients (`32mb 8mb 60` by default) would evict the API, which shows up as an
+interruption rather than as memory. That removes the *application's* backlog,
+not every buffer: the kernel's and the client's own reader still hold whatever
+has arrived.
+
+What the bridge can prove is narrow: when it *knew* it was not listening. It
+tells every page `{"type": "interrupted", "detected_at": …}` and later
+`{"type": "resubscribed", "detected_at": …, "resubscribed_at": …}` — "detected",
+because noticing is not proof of when the connection went. Three things the
+client would not do for it, each found by measurement or by reading its source:
+
+- **Its health check is not a failure detector.** `health_check_interval` sends
+  a PING and never waits for the answer. So the bridge sends its own, one at a
+  time, each with a fixed deadline: against a paused Redis it declared the
+  subscription lost 11.9s in, inside its 15s bound.
+- **Its reconnection can be silent.** On a failed read, redis-py's async retry
+  calls a reconnect that resubscribes inside the client *before* raising — even
+  with zero retries. So the subscription client's retry supports no errors at
+  all, and an unexpected subscribe acknowledgement counts as a resubscription
+  anyway. (The first version handed the async client redis-py's *synchronous*
+  `Retry`, which returns the coroutine before it runs and so catches nothing. It
+  behaved correctly only by accident; review caught it.)
+- **Under RESP3 a subscription's PING reply comes back mangled** —
+  `{"type": "h", "channel": "b", "data": "-"}`, the payload `hb-1` indexed as if
+  it were a list. Under RESP2 it is a proper `pong`, so the subscription speaks
+  RESP2.
+
+Recovered means *acknowledged*: the bridge is back when Redis confirms the
+subscription, with one deadline covering connect, negotiation and confirmation
+together. After `CLIENT KILL` it noticed in 0.27s and was back 0.5s later; after
+a Redis restart, 0.20s and 0.5s. The sandbox's bridge logged an exception and
+stopped, leaving every page on a socket that would never speak again; this one
+backs off and resubscribes for as long as the process runs.
+
+## Fan-out, and the slow socket
+
+The broadcaster is a plain function, not a coroutine, so it *cannot* wait for a
+socket. Each socket has a bounded queue and a sender of its own; a socket whose
+queue fills cannot keep up, so it is removed from fan-out at once and closed
+with 1013, "try again later" — the way Redis treats a slow subscriber, and would
+treat the API. It keeps its admission slot until that cleanup has finished, so
+churn cannot pile up closing sockets beyond the limit of 100. What this detects
+is transport backpressure, not how fast a page's JavaScript runs.
+
+Measured: a flood of 20,000 notifications reached each of five sockets in full,
+with no evictions, while `/health` stayed at a median of 1.7ms (0.5ms quiet).
+SIGTERM with sockets open still exits in about 0.2s; uvicorn closes each one
+with 1012, "service restart", and the page reconnects with backoff like any
+other close.
+
+One bug from building it is worth the space. A first version served each socket
+with `asyncio.wait` and `asyncio.gather`, and a cancellation arriving while
+`gather` waited for tasks it had just cancelled leaked out of anyio's cancel
+scope — Starlette runs the endpoint under anyio. An anyio task group fixed it,
+and gave eviction its ordering for free: the group exits only once the sender
+has stopped, and a WebSocket must not be sent to and closed at the same time.
+
+**`Origin` is checked exactly** — scheme, host and port against the API's own
+origins — and a missing or `null` origin is refused. WebSockets are not covered
+by CORS, so without this any page open in the same browser could read the
+stream, and binding to 127.0.0.1 does not help, because the browser is on
+127.0.0.1 too. It protects against browsers only; any other client can forge
+the header. Refusals, like a full allowance, happen at the handshake, which is
+an HTTP rejection rather than a close code — a browser may only see 1006 — so the
+page answers every failure to connect the same way. Event fields come from
+Redis, which anyone with access can publish to, so the page renders them with
+`textContent`, never as HTML — and the bridge relays only notifications of the
+right shape and size with a finite timestamp, because Python's `json` accepts
+`NaN` and `Infinity`, which are not JSON, and a browser's `JSON.parse` throws on
+them.
+
 ## Derived state, and rebuilding it
 
 Redis runs with persistence off:
@@ -1226,7 +1415,12 @@ Unit tests need no broker.
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest
+node --test "tests/js/*.test.mjs"
 ```
+
+The last one is a separate step, in CI too, rather than something `pytest`
+shells out to: a test that silently skips when Node is missing is a check that
+did not run.
 
 The smoke test does. It asserts both addressing paths against the running
 broker, and is the same check CI runs.
@@ -1241,9 +1435,9 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 115 to 212; 5 counters, 220 last-page values; rows written to smoke_95ba3f32; 4 workers, 219 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; API on port 57650 read back the Redis, Cassandra and ZooKeeper sentinels and states its 404 and 422 contracts; leader …-58386 wrote again at epoch 1 (snapshot v24 -> v25); all 4 workers applied worker_delay=0.03 at config version 1; nothing was left running
+PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 128 to 230; 4 counters, 238 last-page values; rows written to smoke_0c3d67b9; 4 workers, 238 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; API on port 59706 read back the Redis, Cassandra and ZooKeeper sentinels and states its 404 and 422 contracts; leader …-63683 wrote again at epoch 1 (snapshot v25 -> v26); all 4 workers applied worker_delay=0.03 at config version 1; a known event reached a subscribed socket (partition 1, offset 83); foreign and missing origins refused; nothing was left running
 
-all 4 checks passed in 17.7s
+all 4 checks passed in 19.0s
 ```
 
 On a brand new cluster you will also see `NotCoordinatorError` once or twice
@@ -1281,6 +1475,19 @@ hold, under one shared deadline:
   Redis, an event in Cassandra — plus a `/cluster` whose leader matches the one
   ZooKeeper reported, a 404 for an unknown user, a 422 for `limit=101`, and an
   OpenAPI document listing every route.
+
+After readiness, **one known event, end to end**: the check opens a WebSocket,
+waits until the API says it is *subscribed* — `ready` with `bridge:
+"subscribed"`, or a `resubscribed` after a `ready` that said otherwise — then
+produces an event with a known id into the run's topic and requires that event's
+notification, with its partition and offset — under one deadline checked
+explicitly, because a receive timeout never expires while unrelated
+notifications keep arriving, and in the smoke topology they arrive every 50ms.
+Subscribing first matters: pub/sub
+would rightly drop a notification published before the socket was enrolled. It
+also requires a foreign and a missing `Origin` to be refused, and `/live` and its
+module to be served. The run's channel carries the run's key prefix, because
+pub/sub channels ignore the Redis database.
 
 The API check uses sentinels rather than whatever the producer happened to
 write, because it tests the read path only — the other predicates already prove
@@ -1330,9 +1537,15 @@ src/pipeline/
     failover_demo.py     the two-leaders demonstration
     api.py               the HTTP API: one endpoint per store, bounded reads
     bulkhead.py          per-store admission, worker allowance and deadline
+    notifications.py     what the consumer announces, and the best-effort publish
+    bridge.py            the API's one Redis subscription, heartbeat and recovery
+    fanout.py            bounded per-socket queues, eviction and admission
+    static/live.html     the live page
+    static/live.mjs      its offset tracker and read scheduler
     topology_runner.py   starts, observes and stops the whole topology
     smoke_test.py        bounded assertions against a running broker
 tests/
+tests/js/                the tracker's and scheduler's own tests, for node --test
 Procfile                 the processes that make up the running system
 ```
 
