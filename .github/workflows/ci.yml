@@ -43,6 +43,18 @@ jobs:
       - name: Unit tests
         run: uv run pytest
 
+      # The live page's tracker and read scheduler are the release's central
+      # claims, and they are JavaScript. A separate, explicit step rather than
+      # something pytest shells out to: a test that skips when Node is missing
+      # is a check that did not run.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: JavaScript tests
+        run: node --test tests/js/
+
       - name: Validate Compose file
         run: docker compose config --quiet
 

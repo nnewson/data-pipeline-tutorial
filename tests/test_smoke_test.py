@@ -1,3 +1,4 @@
+import json
 import subprocess
 from types import SimpleNamespace
 
@@ -526,6 +527,9 @@ def _topology_scaffold(monkeypatch, topology):
     monkeypatch.setattr(
         smoke_test, "_live_config_reaches_workers", lambda root: (True, "config")
     )
+    monkeypatch.setattr(
+        smoke_test, "_a_known_event_is_notified", lambda *a: (True, "notified")
+    )
     for name in (
         "_clear_redis_prefix",
         "_drop_keyspace",
@@ -596,6 +600,9 @@ def test_the_topology_gets_isolated_state(monkeypatch):
     monkeypatch.setattr(smoke_test, "_leader_is_working", lambda *a: (True, "led"))
     monkeypatch.setattr(
         smoke_test, "_live_config_reaches_workers", lambda root: (True, "config")
+    )
+    monkeypatch.setattr(
+        smoke_test, "_a_known_event_is_notified", lambda *a: (True, "notified")
     )
     monkeypatch.setattr(
         smoke_test, "Topology", lambda env: (captured.update(env), FakeTopology())[1]
@@ -902,3 +909,177 @@ def test_consumer_writes_beside_the_sentinels_pass(monkeypatch):
 
     assert redis_ready() == (True, "1 counters, 1 last-page values")
     assert cassandra_ready()[0] is True
+
+
+# --- the live notification check ----------------------------------------------
+
+
+class FakeLiveSocket:
+    def __init__(self, messages):
+        self.messages = [json.dumps(m) for m in messages]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def recv(self, timeout=None):
+        if not self.messages:
+            raise TimeoutError
+        return self.messages.pop(0)
+
+
+class FakeKafkaProducer:
+    sent: list = []
+
+    def __init__(self, **kwargs):
+        pass
+
+    def send(self, topic, value, partition=None):
+        FakeKafkaProducer.sent.append((topic, value, partition))
+        return SimpleNamespace(get=lambda timeout: None)
+
+    def close(self):
+        pass
+
+
+def _live(monkeypatch, messages, refused=True, routes_ok=True):
+    FakeKafkaProducer.sent = []
+    monkeypatch.setattr(smoke_test, "KafkaProducer", FakeKafkaProducer)
+    monkeypatch.setattr(
+        smoke_test, "websocket_connect", lambda *a, **k: FakeLiveSocket(list(messages))
+    )
+    monkeypatch.setattr(smoke_test, "_socket_refused", lambda port, origin: refused)
+    page = (200, "text/html", '<script type="module">import "./live.mjs"</script>')
+    module = (200, "text/javascript", "export function createTracker")
+    monkeypatch.setattr(
+        smoke_test,
+        "_http_status",
+        lambda port, path: (
+            (page if path == "/live" else module) if routes_ok else (404, "", "")
+        ),
+    )
+    return smoke_test._a_known_event_is_notified(8123, "topic_x", "abc")
+
+
+NOTIFIED = {
+    "type": "pageview",
+    "event_id": "smoke-live-abc",
+    "partition": 2,
+    "offset": 17,
+}
+
+
+def test_the_known_event_is_produced_only_once_subscribed(monkeypatch):
+    passed, detail = _live(
+        monkeypatch, [{"type": "ready", "bridge": "subscribed"}, NOTIFIED]
+    )
+
+    assert passed, detail
+    ((topic, value, partition),) = FakeKafkaProducer.sent
+    assert topic == "topic_x" and value["event_id"] == "smoke-live-abc"
+
+
+def test_a_ready_that_is_not_subscribed_waits_for_resubscription(monkeypatch):
+    """Not merely any ready: producing now could be rightly dropped."""
+    passed, _ = _live(
+        monkeypatch,
+        [
+            {"type": "ready", "bridge": "interrupted"},
+            {"type": "resubscribed", "detected_at": "t", "resubscribed_at": "t"},
+            NOTIFIED,
+        ],
+    )
+
+    assert passed
+
+
+def test_an_interrupted_ready_alone_never_produces(monkeypatch):
+    passed, detail = _live(monkeypatch, [{"type": "ready", "bridge": "interrupted"}])
+
+    assert not passed
+    assert FakeKafkaProducer.sent == []
+    assert "within the bound" in detail
+
+
+def test_other_events_do_not_count_for_the_known_one(monkeypatch):
+    other = {**NOTIFIED, "event_id": "someone-else"}
+    passed, detail = _live(
+        monkeypatch, [{"type": "ready", "bridge": "subscribed"}, other, other]
+    )
+
+    assert not passed
+    assert "smoke-live-abc" in detail
+
+
+def test_an_accepted_foreign_origin_fails_the_check(monkeypatch):
+    passed, detail = _live(
+        monkeypatch,
+        [{"type": "ready", "bridge": "subscribed"}, NOTIFIED],
+        refused=False,
+    )
+
+    assert not passed
+    assert "was accepted" in detail
+
+
+def test_the_page_routes_are_part_of_the_check(monkeypatch):
+    passed, detail = _live(
+        monkeypatch,
+        [{"type": "ready", "bridge": "subscribed"}, NOTIFIED],
+        routes_ok=False,
+    )
+
+    assert not passed
+    assert "/live answered 404" in detail
+
+
+class EndlessTraffic(FakeLiveSocket):
+    """Unrelated messages for ever; every receive moves the fake clock on."""
+
+    def __init__(self, first, clock):
+        super().__init__(first)
+        self.clock = clock
+        self.served = 0
+
+    def recv(self, timeout=None):
+        self.served += 1
+        assert self.served < 500, "kept receiving long past the deadline"
+        self.clock[0] += 1.0
+        if self.messages:
+            return self.messages.pop(0)
+        return json.dumps({**NOTIFIED, "event_id": "someone-else"})
+
+
+def _endless(monkeypatch, first):
+    clock = [1000.0]
+    socket = EndlessTraffic(first, clock)
+    FakeKafkaProducer.sent = []
+    monkeypatch.setattr(smoke_test, "KafkaProducer", FakeKafkaProducer)
+    monkeypatch.setattr(smoke_test, "websocket_connect", lambda *a, **k: socket)
+    result = smoke_test._a_known_event_is_notified(
+        8123, "topic_x", "abc", clock=lambda: clock[0]
+    )
+    return result, clock[0] - 1000.0
+
+
+def test_the_bound_holds_under_continuous_unrelated_traffic(monkeypatch):
+    """Regression: the event was once accepted 101s into a 20s check."""
+    (passed, detail), elapsed = _endless(
+        monkeypatch, [{"type": "ready", "bridge": "subscribed"}]
+    )
+
+    assert not passed
+    assert "within the bound" in detail
+    assert elapsed <= smoke_test.LIVE_TIMEOUT_SECONDS + 1
+
+
+def test_waiting_to_be_subscribed_is_bounded_too(monkeypatch):
+    (passed, _), elapsed = _endless(
+        monkeypatch, [{"type": "ready", "bridge": "interrupted"}]
+    )
+
+    assert not passed
+    assert FakeKafkaProducer.sent == [], "never subscribed, so nothing produced"
+    assert elapsed <= smoke_test.LIVE_TIMEOUT_SECONDS + 1

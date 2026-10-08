@@ -9,7 +9,7 @@ import json
 import threading
 import time
 from collections import namedtuple
-from contextlib import ExitStack
+from contextlib import ExitStack, asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -21,8 +21,9 @@ from cassandra.cluster import NoHostAvailable
 from fastapi.testclient import TestClient
 from kazoo.exceptions import ConnectionLoss, NoNodeError
 from kazoo.handlers.threading import KazooTimeoutError
+from starlette.websockets import WebSocketDisconnect
 
-from pipeline import api
+from pipeline import api, fanout
 from pipeline.api import Stores
 from pipeline.coordination import Paths
 
@@ -35,6 +36,19 @@ Row = namedtuple("Row", "event_time event_id page written_at")
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+class StubBridge:
+    state = "subscribed"
+
+
+@asynccontextmanager
+async def fake_live(prefix):
+    yield api.Live(hub=fanout.Hub(), bridge=StubBridge(), origins=api.allowed_origins())
+
+
+def make_app(**kwargs):
+    return api.create_app(open_live=fake_live, **kwargs)
 
 
 class FakeRedis:
@@ -203,7 +217,7 @@ def stores():
 
 @pytest.fixture
 def client(stores):
-    with TestClient(api.create_app(open_stores=lambda stack: stores)) as client:
+    with TestClient(make_app(open_stores=lambda stack: stores)) as client:
         yield client
 
 
@@ -292,7 +306,7 @@ def test_a_redis_timeout_is_a_503_too(client, stores):
 
 def test_a_redis_bug_is_a_500_not_an_outage(stores):
     stores.redis.fail = redis.ResponseError("WRONGTYPE")
-    app = api.create_app(open_stores=lambda stack: stores)
+    app = make_app(open_stores=lambda stack: stores)
 
     with TestClient(app, raise_server_exceptions=False) as client:
         assert client.get("/counts/pages").status_code == 500
@@ -371,7 +385,7 @@ def test_cluster_reports_leader_snapshot_and_registrations(client):
 
 def test_a_snapshot_from_the_previous_epoch_does_not_match(stores):
     stores.zookeeper.nodes = cluster_nodes(leader_epoch=3, snapshot_epoch=2)
-    with TestClient(api.create_app(open_stores=lambda stack: stores)) as client:
+    with TestClient(make_app(open_stores=lambda stack: stores)) as client:
         body = client.get("/cluster").json()
 
     assert body["leader"]["epoch"] == 3
@@ -382,7 +396,7 @@ def test_a_snapshot_from_the_previous_epoch_does_not_match(stores):
 def test_no_leader_and_an_initial_snapshot_is_not_a_match(stores):
     """`cluster init` writes {"epoch": null}: None == None is not agreement."""
     stores.zookeeper.nodes = cluster_nodes(leader_epoch=None, snapshot_epoch=None)
-    with TestClient(api.create_app(open_stores=lambda stack: stores)) as client:
+    with TestClient(make_app(open_stores=lambda stack: stores)) as client:
         body = client.get("/cluster").json()
 
     assert body["leader"] is None
@@ -400,7 +414,7 @@ def test_a_leader_without_a_snapshot_epoch_is_not_a_match():
 
 def test_an_uninitialised_tree_is_reported_as_absent(stores):
     stores.zookeeper.nodes = {}
-    with TestClient(api.create_app(open_stores=lambda stack: stores)) as client:
+    with TestClient(make_app(open_stores=lambda stack: stores)) as client:
         body = client.get("/cluster").json()
 
     assert body["leader"] is None
@@ -510,7 +524,7 @@ def test_startup_makes_fewer_attempts_than_the_pipeline(monkeypatch):
 
 
 def test_shutdown_closes_every_store(stores):
-    with TestClient(api.create_app(open_stores=api_open(stores))):
+    with TestClient(make_app(open_stores=api_open(stores))):
         pass
 
     assert stores.redis.closed
@@ -538,7 +552,7 @@ async def test_a_saturated_cassandra_cannot_take_the_other_routes_with_it(stores
     Redis and /health still answer; and once the barrier opens, Cassandra's
     capacity comes back.
     """
-    app = api.create_app(open_stores=lambda stack: stores)
+    app = make_app(open_stores=lambda stack: stores)
     app.state.stores = stores
     app.state.bulkheads = api.make_bulkheads(stores)
     stores.cassandra.hold = threading.Event()
@@ -598,6 +612,7 @@ def test_main_connects_before_uvicorn_and_hands_cleanup_to_the_app(monkeypatch):
         order.append("stopped")
 
     monkeypatch.setattr(api, "open_stores", open_stores)
+    monkeypatch.setattr(api, "open_live", fake_live)
     monkeypatch.setattr(api.uvicorn, "run", run)
 
     api.main()
@@ -622,6 +637,7 @@ def test_uvicorn_exiting_before_the_lifespan_still_closes_the_stores(monkeypatch
 
     monkeypatch.setenv("WEB_CONCURRENCY", "2")
     monkeypatch.setattr(api, "open_stores", open_stores)
+    monkeypatch.setattr(api, "open_live", fake_live)
     monkeypatch.setattr(api.uvicorn, "run", exits_early)
 
     with pytest.raises(SystemExit):
@@ -629,3 +645,119 @@ def test_uvicorn_exiting_before_the_lifespan_still_closes_the_stores(monkeypatch
 
     assert closed == ["redis"]
     assert workers == [1], "WEB_CONCURRENCY must not override the single process"
+
+
+# --- Live notifications: the WebSocket ---------------------------------------
+
+
+def live_app(stores, *, limit=100, state="subscribed", closed=None):
+    hub = fanout.Hub(limit=limit)
+
+    class Bridge:
+        pass
+
+    bridge = Bridge()
+    bridge.state = state
+
+    @asynccontextmanager
+    async def open_live(prefix):
+        try:
+            yield api.Live(hub=hub, bridge=bridge, origins=api.allowed_origins())
+        finally:
+            if closed is not None:
+                closed.append(prefix)
+
+    return api.create_app(open_stores=lambda stack: stores, open_live=open_live), hub
+
+
+OURS = {"origin": "http://localhost:8000"}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"origin": "http://evil.example"},
+        {},
+        {"origin": "null"},
+        {"origin": "https://localhost:8000"},
+        {"origin": "http://localhost:8001"},
+    ],
+)
+def test_a_socket_from_anywhere_else_is_refused_at_the_handshake(stores, headers):
+    app, hub = live_app(stores)
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/pageviews", headers=headers):
+                pass
+        assert hub.admitted == 0, "a refused socket takes no slot"
+
+
+@pytest.mark.parametrize("origin", sorted(api.allowed_origins()))
+def test_ready_comes_first_and_states_the_subscription(stores, origin):
+    app, _ = live_app(stores, state="interrupted")
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/pageviews", headers={"origin": origin}
+        ) as ws:
+            assert ws.receive_json() == {"type": "ready", "bridge": "interrupted"}
+
+
+def test_a_broadcast_reaches_an_enrolled_socket(stores):
+    app, hub = live_app(stores)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/pageviews", headers=OURS) as ws:
+            ws.receive_json()
+            client.portal.call(hub.broadcast, '{"type": "pageview", "offset": 4}')
+            assert ws.receive_json() == {"type": "pageview", "offset": 4}
+
+
+def test_the_socket_allowance_refuses_at_the_handshake_and_comes_back(stores):
+    app, hub = live_app(stores, limit=1)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/pageviews", headers=OURS) as first:
+            first.receive_json()
+            with pytest.raises(WebSocketDisconnect):
+                with client.websocket_connect("/ws/pageviews", headers=OURS):
+                    pass
+        with client.websocket_connect("/ws/pageviews", headers=OURS) as again:
+            assert again.receive_json()["type"] == "ready"
+
+
+def test_sockets_come_and_go_cleanly(stores):
+    """Regression: a cancellation once leaked out of anyio's scope on disconnect."""
+    app, hub = live_app(stores)
+    with TestClient(app) as client:
+        for _ in range(25):
+            with client.websocket_connect("/ws/pageviews", headers=OURS) as ws:
+                ws.receive_json()
+        assert hub.admitted == 0
+
+
+def test_the_page_and_its_module_are_served_outside_the_contract(stores):
+    app, _ = live_app(stores)
+    with TestClient(app) as client:
+        page = client.get("/live")
+        module = client.get("/live.mjs")
+        paths = client.get("/openapi.json").json()["paths"]
+
+    assert page.status_code == 200 and page.headers["content-type"].startswith(
+        "text/html"
+    )
+    assert 'from "./live.mjs"' in page.text
+    assert module.headers["content-type"].startswith("text/javascript")
+    assert "export function createTracker" in module.text
+    assert "/live" not in paths and "/live.mjs" not in paths
+
+
+def test_the_page_never_interpolates_event_fields_as_html():
+    """Notifications came from Redis, which anyone with access can write to."""
+    page = api._static("live.html")
+    assert "innerHTML" not in page and "insertAdjacentHTML" not in page
+
+
+def test_shutdown_closes_the_live_path(stores):
+    closed = []
+    app, _ = live_app(stores, closed=closed)
+    with TestClient(app):
+        assert closed == []
+    assert closed == [stores.prefix]

@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
+from websockets.exceptions import InvalidStatus, WebSocketException
+from websockets.sync.client import connect as websocket_connect
 
 from pipeline import (
     cassandra_store,
@@ -662,6 +664,126 @@ def _api_serves_the_stores(
     )
 
 
+LIVE_TIMEOUT_SECONDS = 20
+
+
+def _http_status(port: int, path: str) -> tuple[int | None, str, str]:
+    """Status, content type and body of a non-JSON route."""
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - a fixed localhost URL
+            f"http://127.0.0.1:{port}{path}", timeout=5
+        ) as response:
+            return (
+                response.status,
+                response.headers.get("content-type", ""),
+                response.read().decode(),
+            )
+    except (urllib.error.URLError, OSError) as error:
+        return None, "", str(error)
+
+
+def _socket_refused(port: int, origin: str | None) -> bool:
+    """Whether the handshake is refused for this Origin, missing included."""
+    try:
+        with websocket_connect(
+            f"ws://127.0.0.1:{port}/ws/pageviews", origin=origin, open_timeout=5
+        ):
+            return False
+    except InvalidStatus:
+        return True
+
+
+def _receive_before(socket, deadline: float, clock) -> dict:
+    """The next message, or TimeoutError once the deadline has passed.
+
+    Checked explicitly. A receive timeout alone never expires while unrelated
+    notifications keep arriving — and in the smoke topology they arrive every
+    50ms — so a bound written as `recv(timeout=max(0.1, remaining))` once
+    accepted its event 101 seconds into a 20-second check.
+    """
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError
+    return json.loads(socket.recv(timeout=remaining))
+
+
+def _a_known_event_is_notified(
+    port: int, topic: str, run_id: str, clock=time.monotonic
+) -> tuple[bool, str]:
+    """One known event, end to end: Kafka, consumer, PUBLISH, bridge, socket.
+
+    Subscribing first matters. Pub/sub would rightly drop a notification
+    published before this socket was enrolled, so the event is produced only
+    once the API says it is subscribed — `ready` with `bridge: "subscribed"`,
+    or a `resubscribed` notice after a `ready` that said otherwise. Not merely
+    any `ready`.
+    """
+    event = {
+        "event_id": f"smoke-live-{run_id}",
+        "user_id": f"live-{run_id}",
+        "page": "/docs",
+        "timestamp": time.time(),
+    }
+    origin = f"http://127.0.0.1:{port}"
+    deadline = clock() + LIVE_TIMEOUT_SECONDS
+    try:
+        with websocket_connect(
+            f"ws://127.0.0.1:{port}/ws/pageviews", origin=origin, open_timeout=5
+        ) as socket:
+            subscribed = False
+            while not subscribed:
+                message = _receive_before(socket, deadline, clock)
+                subscribed = (
+                    message["type"] == "ready" and message["bridge"] == "subscribed"
+                ) or message["type"] == "resubscribed"
+
+            producer = KafkaProducer(
+                bootstrap_servers=KAFKA_SERVER,
+                value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+            )
+            try:
+                partition = get_partition(event["user_id"], KAFKA_PARTITIONS)
+                producer.send(topic, event, partition=partition).get(
+                    timeout=PRODUCE_TIMEOUT_SECONDS
+                )
+            finally:
+                producer.close()
+
+            while True:
+                message = _receive_before(socket, deadline, clock)
+                if (
+                    message["type"] == "pageview"
+                    and message["event_id"] == event["event_id"]
+                ):
+                    break
+    except TimeoutError:
+        return False, f"no notification for {event['event_id']} within the bound"
+    except (WebSocketException, OSError, KafkaError, ValueError, KeyError) as error:
+        return False, f"live notification check failed: {type(error).__name__}: {error}"
+
+    if not (
+        isinstance(message["partition"], int) and isinstance(message["offset"], int)
+    ):
+        return False, f"notification without partition and offset: {message}"
+
+    for refused_origin in ("http://evil.example", None):
+        if not _socket_refused(port, refused_origin):
+            return False, f"a socket with Origin {refused_origin!r} was accepted"
+
+    status, kind, body = _http_status(port, "/live")
+    if status != 200 or "text/html" not in kind or "./live.mjs" not in body:
+        return False, f"/live answered {status} {kind}"
+    status, kind, body = _http_status(port, "/live.mjs")
+    if status != 200 or "javascript" not in kind or "createTracker" not in body:
+        return False, f"/live.mjs answered {status} {kind}"
+
+    return True, (
+        f"a known event reached a subscribed socket "
+        f"(partition {message['partition']}, offset {message['offset']}); "
+        f"foreign and missing origins refused"
+    )
+
+
 def honcho_topology_does_the_work() -> tuple[bool, str]:
     """Run the real Procfile topology and assert it does its job.
 
@@ -736,6 +858,11 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                     if working:
                         working, config_detail = _live_config_reaches_workers(root)
                         detail = f"{detail}; {config_detail}"
+                    if working:
+                        working, live_detail = _a_known_event_is_notified(
+                            api_port, topic, run_id
+                        )
+                        detail = f"{detail}; {live_detail}"
                     observed = (working, f"{readiness_detail}; {detail}")
     finally:
         if started:

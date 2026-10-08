@@ -78,6 +78,20 @@ def no_real_connections(request, monkeypatch):
         "wait_for_connection; update CONNECTING_MODULES"
     )
 
+    # The API's Redis subscription does not go through wait_for_connection: the
+    # bridge retries for ever on its own, so a test that started a real one
+    # would leave it reconnecting in the background rather than fail.
+    def refuse_subscription(*args, **kwargs):
+        raise RealConnectionAttempted(
+            "unit test tried to open a real Redis subscription. "
+            "Pass create_app a fake open_live, or mark the test allow_connect."
+        )
+
+    from pipeline import api, bridge
+
+    monkeypatch.setattr(bridge, "open_client", refuse_subscription)
+    monkeypatch.setattr(api, "open_subscription_client", refuse_subscription)
+
     # Kafka clients are constructed directly rather than through the helper, so
     # the guard cannot reach them; those call sites are stubbed per test.
 
