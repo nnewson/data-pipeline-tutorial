@@ -12,13 +12,21 @@ release left it with fewer partitions, and leaves it alone otherwise.
 import logging
 
 from pipeline import ensure_topic
-from pipeline.config import KAFKA_PARTITIONS, KAFKA_SERVER, KAFKA_TOPIC
+from pipeline.config import (
+    KAFKA_PARTITIONS,
+    KAFKA_SERVER,
+    KAFKA_TOPIC,
+    KAFKA_WINDOWS_TOPIC,
+)
 
 logger = logging.getLogger("topics")
 
 
 def main() -> int:
     ensure_topic(KAFKA_TOPIC, KAFKA_PARTITIONS, KAFKA_SERVER)
+    # The Flink job's results, keyed by page. Four partitions like the input,
+    # though nothing depends on that matching.
+    ensure_topic(KAFKA_WINDOWS_TOPIC, KAFKA_PARTITIONS, KAFKA_SERVER)
     return 0
 
 

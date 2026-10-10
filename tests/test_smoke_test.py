@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -216,6 +217,7 @@ EXPECTED_CHECKS = [
     "internal listener",
     "partition routing",
     "honcho topology",
+    "flink windows",
 ]
 
 
@@ -1083,3 +1085,361 @@ def test_waiting_to_be_subscribed_is_bounded_too(monkeypatch):
     assert not passed
     assert FakeKafkaProducer.sent == [], "never subscribed, so nothing produced"
     assert elapsed <= smoke_test.LIVE_TIMEOUT_SECONDS + 1
+
+
+# --- the Flink round trip ------------------------------------------------------
+
+
+def test_flink_events_cover_every_partition_and_advance_past_closure():
+    events, expected = smoke_test._flink_events(window_start=1000)
+
+    assert {partition for partition, _ in events} == {0, 1, 2, 3}
+    counted = [e for _, e in events if e["page"] != "/advance"]
+    assert all(1000 <= e["timestamp"] < 1010 for e in counted)
+    assert expected == {"/docs": 12, "/pricing": 8}
+    advance = [(p, e) for p, e in events if e["page"] == "/advance"]
+    assert {p for p, _ in advance} == {0, 1, 2, 3}, "on every partition"
+    # Beyond window end *plus* the watermark delay, not merely past the end.
+    assert all(
+        e["timestamp"] > 1010 + smoke_test.FLINK_WATERMARK_DELAY_SECONDS
+        for _, e in advance
+    )
+
+
+class FakeFlink:
+    def __init__(
+        self,
+        states=("RUNNING",),
+        checkpoints=1,
+        cancel_to="CANCELED",
+        named=(),
+        cancel_fails=False,
+        listing_fails=False,
+    ):
+        self.states = list(states)
+        self.checkpoints = checkpoints
+        self.cancel_to = cancel_to
+        self.cancelled: list[str] = []
+        self.submitted: list = []
+        self.named = list(named)  # jobs the cluster holds under the run's name
+        self.looked_up: list[str] = []
+        self.cancel_fails = cancel_fails
+        self.listing_fails = listing_fails
+
+    def jobs_named(self, name):
+        self.looked_up.append(name)
+        if self.listing_fails:
+            raise smoke_test.flink_cluster.FlinkError("connection reset")
+        return list(self.named)  # stopped jobs included, as the REST API lists them
+
+    def submit(self, settings):
+        self.submitted.append(settings)
+        return "f" * 32
+
+    def job_state(self, job_id):
+        if self.cancelled:
+            return self.cancel_to
+        return self.states.pop(0) if len(self.states) > 1 else self.states[0]
+
+    def completed_checkpoints(self, job_id):
+        return self.checkpoints
+
+    def cancel(self, job_id):
+        if self.cancel_fails:
+            raise smoke_test.flink_cluster.FlinkError("connection refused")
+        self.cancelled.append(job_id)
+
+
+class FakeWindowsConsumer:
+    def __init__(self, records):
+        self.records = records
+
+    def __iter__(self):
+        return iter(
+            [SimpleNamespace(value=json.dumps(r).encode()) for r in self.records]
+        )
+
+    def close(self):
+        pass
+
+
+def _flink_check(
+    monkeypatch, flink, records, clock=None, consumer=None, reconcile_seconds=0
+):
+    deleted = []
+    monkeypatch.setattr(
+        smoke_test,
+        "flink_cluster",
+        SimpleNamespace(
+            submit=flink.submit,
+            job_state=flink.job_state,
+            cancel=flink.cancel,
+            completed_checkpoints=flink.completed_checkpoints,
+            jobs_named=flink.jobs_named,
+            FlinkError=smoke_test.flink_cluster.FlinkError,
+            SubmissionUncertain=smoke_test.flink_cluster.SubmissionUncertain,
+            TERMINAL=smoke_test.flink_cluster.TERMINAL,
+        ),
+    )
+    monkeypatch.setattr(smoke_test, "FLINK_RECONCILE_SECONDS", reconcile_seconds)
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(smoke_test, "ensure_topic", lambda *a, **k: None)
+    monkeypatch.setattr(smoke_test, "_delete_topic", deleted.append)
+    monkeypatch.setattr(
+        smoke_test,
+        "KafkaProducer",
+        lambda **k: SimpleNamespace(
+            send=lambda *a, **k: None, flush=lambda **k: None, close=lambda: None
+        ),
+    )
+    monkeypatch.setattr(
+        smoke_test, "_wait_for", lambda condition, deadline, clock=None: condition()
+    )
+    monkeypatch.setattr(smoke_test.time, "time", lambda: 1_000_000.0)
+    window = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1_000_000 - 600))
+    rendered = [{**r, "window_start": r.get("window_start", window)} for r in records]
+    monkeypatch.setattr(
+        smoke_test,
+        "KafkaConsumer",
+        lambda *a, **k: (
+            consumer if consumer is not None else FakeWindowsConsumer(rendered)
+        ),
+    )
+    kwargs = {} if clock is None else {"clock": clock}
+    return smoke_test.flink_windows_round_trip(**kwargs), deleted
+
+
+EXACT = [{"page": "/docs", "views": 12}, {"page": "/pricing", "views": 8}]
+
+
+def test_the_flink_check_passes_on_exact_counts_and_a_checkpoint(monkeypatch):
+    flink = FakeFlink()
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert passed, detail
+    assert flink.cancelled == ["f" * 32], "cancelled by its captured id"
+    assert len(deleted) == 2
+    (settings,) = flink.submitted
+    assert settings.idle_timeout_seconds == 0, "closure must not depend on idleness"
+
+
+def test_the_flink_check_requires_exact_counts(monkeypatch):
+    (passed, detail), _ = _flink_check(
+        monkeypatch,
+        FakeFlink(),
+        [{"page": "/docs", "views": 11}],
+        clock=iter(range(0, 10_000, 50)).__next__,
+    )
+
+    assert not passed
+    assert "wanted" in detail
+
+
+def test_the_flink_check_requires_a_completed_checkpoint(monkeypatch):
+    """Right counts and RUNNING can both come before any checkpoint."""
+    (passed, detail), _ = _flink_check(monkeypatch, FakeFlink(checkpoints=0), EXACT)
+
+    assert not passed
+    assert "no completed checkpoint" in detail
+
+
+def test_a_job_that_will_not_cancel_fails_the_check(monkeypatch):
+    (passed, detail), deleted = _flink_check(
+        monkeypatch, FakeFlink(cancel_to="RUNNING"), EXACT
+    )
+
+    assert not passed
+    assert "did not stop after being cancelled" in detail
+    assert "the check itself passed" in detail, "both outcomes are reported"
+    assert deleted == [], "not deleted underneath a job that may still run"
+
+
+def _uncertain(settings):
+    raise smoke_test.flink_cluster.SubmissionUncertain("timed out without a job id")
+
+
+def test_an_uncertain_submission_with_no_job_found_keeps_the_topics(monkeypatch):
+    """Regression: topics deleted at the window's end, the job landed a second later.
+
+    Not finding a job proves nothing: the submitter in the container may still
+    be running, however long the window was.
+    """
+    flink = FakeFlink()
+    flink.submit = _uncertain
+    ticks = iter(range(1_000_000))
+    (passed, detail), deleted = _flink_check(
+        monkeypatch, flink, EXACT, clock=lambda: next(ticks), reconcile_seconds=20
+    )
+
+    assert not passed
+    assert "submission uncertain" in detail
+    assert len(flink.looked_up) >= 20, "looked for the whole window"
+    assert flink.looked_up[0].startswith("smoke-flink-")
+    assert "may still land" in detail and "shutdown incomplete" in detail
+    assert deleted == [], "kept for a submission that may still land"
+
+
+def test_an_uncertain_submission_is_reconciled_by_the_runs_unique_name(monkeypatch):
+    """Regression: an accepted-but-unreported job was left running, topics deleted."""
+    flink = FakeFlink(named=["d" * 32])
+    flink.submit = _uncertain
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert not passed
+    assert flink.cancelled == ["d" * 32], "found by the run's name, cancelled by id"
+    assert len(deleted) == 2, "only once the shutdown was confirmed"
+
+
+def test_inputs_are_kept_while_a_shutdown_is_unconfirmed(monkeypatch):
+    flink = FakeFlink(named=["d" * 32], cancel_fails=True)
+    flink.submit = _uncertain
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert not passed
+    assert deleted == [], "never delete the inputs underneath a job that may run"
+    assert "submission uncertain" in detail and "shutdown incomplete" in detail
+
+
+def test_a_readiness_failure_and_a_shutdown_failure_are_both_reported(monkeypatch):
+    """Regression: an early return once hid the cancellation failure."""
+    flink = FakeFlink(states=("CREATED",), cancel_fails=True)
+    monkeypatch.setattr(
+        smoke_test, "_wait_for", lambda condition, deadline, clock=None: False
+    )
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert not passed
+    assert "never reached RUNNING" in detail
+    assert "could not cancel job" in detail
+    assert deleted == []
+
+
+def test_reconciliation_keeps_looking_after_an_uncertain_submission(monkeypatch):
+    """The in-container submission may land after the client gave up."""
+    flink = FakeFlink()
+    flink.submit = _uncertain
+    lookups = []
+
+    def jobs_named(name):
+        lookups.append(name)
+        return ["e" * 32] if len(lookups) >= 3 else []
+
+    flink.jobs_named = jobs_named
+    ticks = iter(range(1_000_000))
+    (passed, detail), deleted = _flink_check(
+        monkeypatch, flink, EXACT, clock=lambda: next(ticks), reconcile_seconds=10
+    )
+
+    assert len(lookups) >= 3, "looked again rather than once"
+    assert flink.cancelled == ["e" * 32]
+
+
+def test_a_known_job_is_stopped_even_when_the_name_lookup_fails(monkeypatch):
+    """Regression: a failed listing returned before cancelling the captured id."""
+    flink = FakeFlink(listing_fails=True)
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert flink.cancelled == ["f" * 32], "the captured id is still cancelled"
+    assert not passed
+    assert "could not list jobs named smoke-flink-" in detail, "the error is kept"
+    assert deleted == []
+
+
+def test_a_job_that_already_failed_is_not_cancelled_and_its_topics_go(monkeypatch):
+    """Flink refuses to cancel a stopped job; stopped is what cleanup needs."""
+    flink = FakeFlink(states=("FAILED",))
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert flink.cancelled == [], "no cancel for a job that already stopped"
+    assert not passed
+    assert "never reached RUNNING" in detail
+    assert "had already stopped: FAILED" in detail
+    assert "shutdown incomplete" not in detail
+    assert len(deleted) == 2
+
+
+def test_a_job_that_stops_while_being_cancelled_counts_as_stopped(monkeypatch):
+    """The cancel is refused because the job got there first."""
+    flink = FakeFlink(states=("RUNNING", "RUNNING", "FAILED"), cancel_fails=True)
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert not passed, "a streaming job that stopped by itself is a failure"
+    assert "the check itself passed" in detail
+    assert "had already stopped: FAILED" in detail
+    assert "shutdown incomplete" not in detail
+    assert len(deleted) == 2
+
+
+def test_a_cancelled_job_that_ends_failed_counts_as_stopped(monkeypatch):
+    flink = FakeFlink(cancel_to="FAILED")
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert passed, detail
+    assert len(deleted) == 2
+
+
+def test_an_unexpected_submission_error_is_reconciled_as_uncertain(monkeypatch):
+    """Whatever escapes the submission may have left a job behind."""
+    flink = FakeFlink(named=["d" * 32])
+
+    def undecodable(settings):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    flink.submit = undecodable
+    (passed, detail), deleted = _flink_check(monkeypatch, flink, EXACT)
+
+    assert not passed
+    assert flink.cancelled == ["d" * 32]
+    assert len(deleted) == 2, "confirmed: the run's one job was found and stopped"
+
+
+def test_a_submission_that_never_ran_needs_no_reconciliation(monkeypatch):
+    flink = FakeFlink()
+
+    def never_ran(settings):
+        raise smoke_test.flink_cluster.FlinkError("could not run the submission")
+
+    flink.submit = never_ran
+    (passed, detail), deleted = _flink_check(
+        monkeypatch, flink, EXACT, reconcile_seconds=20
+    )
+
+    assert not passed
+    assert "could not run the submission" in detail
+    assert flink.looked_up == [], "nothing was submitted, so nothing to find"
+    assert len(deleted) == 2
+
+
+class EndlessWindows(FakeWindowsConsumer):
+    """Unrelated results for ever — a job that never stops writing."""
+
+    def __iter__(self):
+        for served in range(1_000_000):
+            # Fail fast rather than hang if the loop stops consulting the clock.
+            assert served < 5_000, "kept reading long past the deadline"
+            yield SimpleNamespace(
+                value=json.dumps(
+                    {
+                        "window_start": "1970-01-01T00:00:00Z",
+                        "page": "/other",
+                        "views": 1,
+                    }
+                ).encode()
+            )
+
+
+def test_the_flink_bound_holds_while_output_keeps_arriving(monkeypatch):
+    """0.9's lesson: a bound that waits for silence never expires under traffic."""
+    calls = [0]
+
+    def clock():
+        calls[0] += 1
+        assert calls[0] < 10_000, "kept reading long past the deadline"
+        return calls[0] * 0.1
+
+    (passed, detail), _ = _flink_check(
+        monkeypatch, FakeFlink(), [], clock=clock, consumer=EndlessWindows([])
+    )
+
+    assert not passed
+    assert "wanted" in detail

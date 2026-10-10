@@ -1,8 +1,21 @@
-# The system as it stands at 0.2: a Kafka broker, and nothing else. Application
-# processes — the producer and consumer — run on the host, against it.
+# The infrastructure. Application processes — producer, consumers, workers,
+# coordinators and the API — run on the host under Honcho, against it.
 #
-# 0.1's throwaway `web` and `shell` services are gone. Kafka's own image carries
-# the CLI tools this release needs, which is the pattern from here on.
+# Flink is infrastructure too: a job is submitted to it, not run under Honcho.
+# Both Flink services share one image, built from flink.Dockerfile.
+
+x-flink: &flink
+  build:
+    context: .
+    dockerfile: flink.Dockerfile
+  image: data-pipeline-tutorial-flink:0.10
+  volumes:
+    # Shared by jobmanager and taskmanager: filesystem checkpoint storage has to
+    # be reachable by both.
+    - flink-checkpoints:/opt/flink/checkpoints
+  depends_on:
+    kafka:
+      condition: service_healthy
 
 services:
 
@@ -168,9 +181,48 @@ services:
       retries: 10
       start_period: 20s
 
+  flink-jobmanager:
+    <<: *flink
+    command: jobmanager
+    ports:
+      # The dashboard and REST API, from the host.
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        rest.bind-address: 0.0.0.0
+        parallelism.default: 4
+        execution.checkpointing.dir: file:///opt/flink/checkpoints
+        python.client.executable: python3
+        python.executable: python3
+        jobmanager.memory.process.size: 1024m
+    healthcheck:
+      # Healthy means "can run a job": the REST API answers and a taskmanager has
+      # registered — not merely that a JVM started.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview | grep -q '\"taskmanagers\":[1-9]'"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  flink-taskmanager:
+    <<: *flink
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        # Eight slots for a parallelism of four: room for the smoke test's own
+        # job beside one a reader left running, rather than a slot timeout.
+        taskmanager.numberOfTaskSlots: 8
+        parallelism.default: 4
+        execution.checkpointing.dir: file:///opt/flink/checkpoints
+        taskmanager.memory.process.size: 1728m
+
 volumes:
   kafka-data:
   cassandra-data:
   rabbitmq-data:
   zookeeper-data:
   zookeeper-datalog:
+  flink-checkpoints:

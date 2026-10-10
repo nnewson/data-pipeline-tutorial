@@ -10,6 +10,9 @@ on:
       # a tag push as on a branch push. A workflow cannot prevent a tag from
       # existing; publishing the release after they pass is the actual gate.
       - "*"
+  # By hand, to check a release's images still build from nothing — the pinned
+  # Flink base image, its apt packages, and the connector's URL and hash.
+  workflow_dispatch:
 
 jobs:
   quality:
@@ -86,9 +89,22 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --frozen
 
+      - name: Build the Flink image
+        # Cache-free on tags and manual runs, so a release proves the pinned base
+        # image is still retrievable and the connector's URL and SHA-256 still
+        # resolve. A fresh runner has no layer cache either way, so on branches
+        # the difference is only --pull: the cache this saves is a laptop's.
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            docker compose build --pull --no-cache
+          else
+            docker compose build
+          fi
+
       - name: Start the topology
         # --wait blocks until every service with a healthcheck reports healthy,
-        # so readiness is asserted rather than slept through.
+        # so readiness is asserted rather than slept through. That now includes
+        # Flink: the jobmanager is healthy once a taskmanager has registered.
         run: docker compose up -d --wait
 
       - name: Create topics
