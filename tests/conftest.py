@@ -92,6 +92,20 @@ def no_real_connections(request, monkeypatch):
     monkeypatch.setattr(bridge, "open_client", refuse_subscription)
     monkeypatch.setattr(api, "open_subscription_client", refuse_subscription)
 
+    # Flink: the REST API and `docker compose exec` are paths to a real cluster.
+    # Tests of those two functions mark themselves allow_connect and stub the
+    # layer beneath.
+    def refuse_flink(*args, **kwargs):
+        raise RealConnectionAttempted(
+            "unit test tried to reach the Flink cluster. "
+            "Stub flink_cluster.request or submit, or mark the test allow_connect."
+        )
+
+    from pipeline import flink_cluster
+
+    monkeypatch.setattr(flink_cluster, "request", refuse_flink)
+    monkeypatch.setattr(flink_cluster, "submit", refuse_flink)
+
     # Kafka clients are constructed directly rather than through the helper, so
     # the guard cannot reach them; those call sites are stubbed per test.
 

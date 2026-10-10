@@ -1,0 +1,5 @@
+# The Flink image needs exactly one file from this repository. An allow-list,
+# so the build context stays a few kilobytes rather than shipping .venv and
+# everything else to the Docker daemon on every build.
+*
+!src/pipeline/flink_job.py

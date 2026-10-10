@@ -91,3 +91,10 @@ SNAPSHOT_INTERVAL_SECONDS = float(os.environ.get("SNAPSHOT_INTERVAL_SECONDS", "2
 # no container is a client of it. Overridable so a test run can bind a port of
 # its own.
 API_PORT = int(os.environ.get("API_PORT", "8000"))
+
+# Where the Flink job writes each window's result. Created by create-topics,
+# like every other topic: the broker refuses auto-creation.
+KAFKA_WINDOWS_TOPIC = os.environ.get("KAFKA_WINDOWS_TOPIC", "pageview_windows")
+
+# Flink's REST API and dashboard, from the host.
+FLINK_REST_URL = os.environ.get("FLINK_REST_URL", "http://localhost:8081")

@@ -4,18 +4,18 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.9 — WebSockets and Redis pub/sub.** Push instead of poll,
-and the third messaging pattern: a live page that updates as events are applied.
-Redis pub/sub keeps nothing and acknowledges nothing, so the page treats every
-notification as a hint, reads the state it points at, and uses Kafka's offsets to
-notice some of what it missed — never all of it.
+**This release: 0.10 — Flink: the job.** Stateful stream processing as a
+self-contained unit: a Flink job counting page views in ten-second windows of
+event time, from Kafka to Kafka. Event time makes the counts mean something;
+watermarks decide when a window is done; and what a restart does to the results
+is decided by checkpoints and the sink, not by the framework's name.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.9
+git checkout 0.10
 ```
 
 ## Prerequisites
@@ -33,7 +33,8 @@ docker compose up -d --wait
 ```
 
 `--wait` blocks until the broker answers an API request, not merely until the
-container starts.
+container starts. The first run also builds the Flink image from
+`flink.Dockerfile`, which downloads a 1.6GB base image once.
 
 ## Running the pipeline
 
@@ -1241,6 +1242,218 @@ right shape and size with a finite timestamp, because Python's `json` accepts
 `NaN` and `Infinity`, which are not JSON, and a browser's `JSON.parse` throws on
 them.
 
+## Flink: counting in event time
+
+```bash
+uv run create-topics          # now also creates pageview_windows
+uv run flink-job submit
+uv run producer               # or the whole topology: uv run honcho start
+uv run windows
+```
+
+```text
+  …
+  2026-10-08T18:42:10Z  /            4
+  2026-10-08T18:42:10Z  /docs        4
+  2026-10-08T18:42:10Z  /pricing     1
+  2026-10-08T18:42:20Z  /            4
+  2026-10-08T18:42:20Z  /checkout    5
+  2026-10-08T18:42:20Z  /docs        1
+
+  297 results; 0 repeated an earlier one
+```
+
+While the job is running it also prints how many late records the job has
+dropped, read from Flink's REST API — or *unavailable*, when that cannot be read.
+It reads the topic up to the end it had when it started, under a deadline, and
+says so if it did not get there: with results still arriving, a read that waited
+for the topic to go quiet need never end. The read has a 15-second budget,
+started before connecting. Connecting and finding the topic's partitions have
+fixed bounds of their own, chosen to fit inside it; every later call gets what
+is left; and closing the consumer is bounded separately, on top. That is a
+budget with every step bounded, not a hard end-to-end guarantee. Against a
+broker paused at each step in turn, the read gave up in 5 to 15 seconds — with
+a clear error when it had nothing to show, and as an incomplete read when it
+had begun.
+
+A Flink job reads `pageviews`, counts views per page in ten-second windows of
+**event time** — when the views happened, by the producer's timestamp, not when
+Flink processed them — and writes each window's result to `pageview_windows`.
+The dashboard is at [localhost:8081](http://localhost:8081): the job graph, each
+partition's watermark, checkpoints, backpressure. Nothing reads the results yet
+except `uv run windows`; 0.11 wires them into the live page.
+
+The job is Flink SQL, run through PyFlink, using the window table-valued
+function:
+
+```sql
+INSERT INTO pageview_windows
+SELECT window_start, window_end, page, COUNT(*) AS `views`
+FROM TABLE(TUMBLE(TABLE valid_pageviews, DESCRIPTOR(event_time), INTERVAL '10' SECOND))
+GROUP BY window_start, window_end, page
+```
+
+(`views` is quoted because `VIEWS` is reserved in Flink SQL.)
+
+It is the first real client of the internal Kafka listener: Flink runs in
+Compose, so it reaches the broker at `kafka:29092`, the address 0.2 built and the
+smoke test has proven every release since. A job is *submitted* to Flink rather
+than run under Honcho, and a Python job's graph is built by running its driver,
+so submission happens inside the jobmanager container:
+
+```bash
+docker compose exec flink-jobmanager flink run -d -py /opt/pipeline/flink_job.py
+```
+
+`uv run flink-job submit` does exactly that; `uv run flink-job status` and
+`uv run flink-job cancel <id>` complete it. Cancel by id, never by name.
+
+**Every submission starts from the beginning of the topic** and writes every
+window again, so cancelling and resubmitting repeats earlier results on
+`pageview_windows` — `uv run windows` counts the repeats. That is deliberate. A
+fresh job that resumed from the consumer group's committed offsets instead
+would start past events whose windows were still open, with none of their
+partial counts, and emit those windows short — silently. Restoring state and
+offsets *together* needs a retained checkpoint and an explicit restore, which is
+0.11's submitter; this release does not pretend a resubmission can do it.
+
+## Watermarks: when is a window done?
+
+Event time needs a rule for when a window is complete, because an event for it
+could in principle still be on its way. That rule is the **watermark**: a claim
+that no earlier event is still to come. This job's watermark is the newest event
+time seen, minus two seconds.
+
+Two precisions that are easy to get wrong:
+
+- **An event is dropped as late only if its window has already been emitted** —
+  the watermark had passed that window's end. An event merely out of order still
+  enters a window that is open. The two-second delay keeps windows open that much
+  longer.
+- **Progress is set by the minimum watermark among a source's active
+  partitions**, not by how many events each partition carries. 0.3's routing
+  skew makes a lagging partition plausible, but measured over two runs no
+  partition reliably set the clock: partition 3, the quietest, held the minimum
+  in 25 of 57 samples in one run and 12 of 57 in the next.
+
+A partition with nothing to say holds everything back, so the job marks a
+partition **idle** after ten seconds without records, and stops waiting for it.
+Measured with the producer at its default one event a second:
+
+| idle timeout | a window's result arrives after the window's end |
+|---|---|
+| 10s | 8.2s median, 12.6s at most |
+| off | 11.2s median, 19.7s at most |
+
+The price of idleness is that it is decided on *processing* time: a partition
+that resumes after being declared idle can deliver events whose window has
+already been emitted, and they are dropped.
+
+**Late events are dropped silently.** SQL gives them no side output, so the only
+witness is a metric, `numLateRecordsDropped`, which `uv run windows` reads from
+the REST API. Measured: an event sent after its window's result appeared changed
+nothing on the output topic, and the metric rose by one. Two details from getting
+that measurement right. The planner splits the aggregation into a local phase
+chained onto the source and a global phase downstream, and the metric belongs to
+the global one. And the REST API serves metrics from a cache refreshed every few
+seconds, so a single reading straight after an event can still show the old
+value — the measurement polls until the change appears. A metric that cannot be
+read is shown as *unavailable*, never as zero.
+
+## What the job accepts
+
+`json.ignore-parse-errors` sounds like "skip bad records", and it is not quite:
+a field it cannot parse becomes `NULL` in a row that is kept, and a missing field
+is `NULL` by default. Left alone, a record with no page would be counted under a
+`NULL` page. So the job names what a valid row needs — a page, and a timestamp
+this pipeline could have produced — and filters before counting.
+
+The timestamp needs more care than a filter, because it feeds the watermark
+before any filter runs. A missing one would make a null row time, which Flink
+refuses; one too large would overflow the conversion; and one in the future,
+however plausible-looking, can push the watermark ahead and make every later
+window late. So the event-time expression accepts a timestamp only if it is
+after 2000 and **no more than a minute ahead of the moment the job reads it** —
+our producer stamps events as it creates them — and maps anything else to the
+epoch, which can never advance the watermark; the filter then excludes it.
+
+The first version used a fixed range instead, 2000 to 2100, and that was not
+enough: 2099 is inside it. Measured, a 2099 event on every partition made the
+next two windows late and dropped twelve valid records; with the one-minute
+rule, the same input dropped none. The rule reads processing time, so it can
+decide differently on a replay: an event rejected as "future" when first read
+becomes acceptable once its time has passed.
+
+Measured with the rule in place, one window with eight valid events and nine bad
+records — malformed JSON, a missing page, an empty page, and a missing, null,
+non-numeric, far-future, negative and `1e400` timestamp: the result was exactly
+eight, and the job never failed.
+
+## State, checkpoints, and what a restart repeats
+
+A window is state: the counts so far for every open window. Two settings decide
+what a failure does to it, and they are easy to run together:
+
+- **Checkpointing is `EXACTLY_ONCE` inside the job.** Every ten seconds Flink
+  snapshots window state and source offsets together, to a volume both Flink
+  containers share, and restores both on failure. A restored count holds each
+  event's contribution once.
+- **The sink is `at-least-once` at the edge.** Results written after the last
+  completed checkpoint can be written again after a restore.
+
+Consistent counts, possibly repeated output records. Measured with the failure
+point controlled: a completed checkpoint; a window's result (`/docs`, 8) emitted
+after it; the taskmanager killed before the next checkpoint. The job restored from
+that checkpoint 20.9s later and wrote the same result again.
+
+| write | on recovery |
+|---|---|
+| Flink window result → Kafka (exactly-once state, at-least-once sink) | results since the last checkpoint written again; identical when the same events are accepted, which the timing policy does not guarantee |
+
+That last clause matters. `COUNT(*)` is deterministic for the same *accepted*
+events, but idleness is decided on processing time, so an event excluded in the
+first run could be counted in the replay. The repeat above was identical because
+the input was controlled. A downstream writer keyed by page and window — 0.11's —
+makes a *repeated* result harmless, the way 0.4's `SET` and 0.5's upsert do. It
+does not choose between two *different* ones.
+
+Exactly-once output exists — Kafka transactions committed on checkpoint, with
+results visible only once a checkpoint completes and consumers reading
+`read_committed` — and this release does not need it. Its only reader is a person
+at a terminal.
+
+**What recovery does not cover:** a taskmanager failure restarts the job from its
+checkpoint, but a *jobmanager* restart, in this session cluster without high
+availability, loses the job. Measured by accident: recreating the Flink
+containers after an image rebuild left the cluster knowing nothing of the job.
+Nor were its checkpoints left behind to restore from: by default Flink deletes
+a job's checkpoints when it stops, and what remained on the volume was empty
+directories. Nothing resubmits the job — that is 0.11's submitter, which will
+have to retain checkpoints deliberately before it can restore from one.
+
+## Pinned hard
+
+Flink is the most version-sensitive software in the tutorial, so it is the one
+exception to readable tags. Every input is fixed and recorded in
+`flink.Dockerfile`:
+
+| component | version | why |
+|---|---|---|
+| Flink | 2.2.1, Java 17, Ubuntu 24.04 | by the image's multi-arch **index** digest, so both amd64 and arm64 resolve. The tag moves: the 2.2.1 images were rebuilt on 2026-10-02 |
+| Kafka SQL connector | 5.0.0-2.2 | Apache lists 5.0.0 as compatible with Flink 2.1.x and 2.2.x; there is none for 2.3, which is why this is not 2.3.0 |
+| its integrity | SHA-256 `5605c691…62c5616` | Maven Central publishes only SHA-1 and a PGP signature. The signature was verified once against Apache Flink's `KEYS` — key `CC33 2388 50B5 A926 24ED 7F62 16AE 0DDB BB2F 380B` — and every build checks the hash |
+| Python | 3.12, from Ubuntu | the minor version is fixed by the base image; the patch level is whatever the archive serves when the image is built |
+| PyFlink | the copy Flink ships | needs `typing_extensions` to import and `ruamel.yaml` to execute statements — an import-only check misses the second |
+| Kafka client inside the connector | 4.2.0 | against the 4.3.1 broker: clients work with newer brokers |
+
+The host never installs PyFlink. The job's statements are built by plain
+functions the host imports and tests; `pyflink` is imported only inside the
+container. That keeps Java and a several-hundred-megabyte wheel off every
+reader's machine.
+
+The cost of all this is real: the image is 1.67GB, and the two Flink containers
+take about 2GiB of memory between them at rest.
+
 ## Derived state, and rebuilding it
 
 Redis runs with persistence off:
@@ -1262,6 +1475,7 @@ Three services, three answers to "what survives being replaced":
 | Cassandra | a durable, query-oriented materialized view | yes |
 | RabbitMQ | durable work awaiting completion | yes, but only while unacknowledged |
 | ZooKeeper | coordination state | persistent znodes survive; **ephemeral ones die with their session**, which is the point of them |
+| Flink | a stateful job's checkpoints | a volume, shared by both Flink containers, so a running job survives a taskmanager failure. Not beyond the job: Flink deletes checkpoints when a job stops, and the job itself does not survive a jobmanager restart without high availability |
 
 Cassandra is still *derived* from the Kafka log — everything in it can be
 rebuilt by the same replay that rebuilds Redis. Its volume changes how durable
@@ -1369,8 +1583,8 @@ wrong advertised address fails in a particular way: the connection succeeds and
 every produce afterwards fails, because the client was handed somewhere it
 cannot reach.
 
-Host processes use `localhost:9092`. Containers use `kafka:29092` — nothing does
-yet, but Flink will at 0.10, and the smoke test proves the path works now.
+Host processes use `localhost:9092`. Containers use `kafka:29092` — Flink does,
+from 0.10, and the smoke test has proven the path since 0.2.
 
 ```bash
 # From the host
@@ -1384,8 +1598,9 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
 RabbitMQ follows the same pattern: `localhost:5672` from the host,
 `rabbitmq:5672` from inside the network, with the management UI published
 separately at [localhost:15672](http://localhost:15672). ZooKeeper is
-`localhost:2181` and `zookeeper:2181` — the last new service before Flink brings
-a jobmanager and taskmanager of its own at 0.10. The API has only
+`localhost:2181` and `zookeeper:2181`. Flink's dashboard and REST API are
+`localhost:8081`; its jobmanager and taskmanager reach Kafka at `kafka:29092`
+from inside the network. The API has only
 `localhost:8000`, because it is a host process and no container is its client.
 
 It also needs a real user, which the others do not. RabbitMQ's built-in `guest`
@@ -1435,10 +1650,30 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 128 to 230; 4 counters, 238 last-page values; rows written to smoke_0c3d67b9; 4 workers, 238 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; API on port 59706 read back the Redis, Cassandra and ZooKeeper sentinels and states its 404 and 422 contracts; leader …-63683 wrote again at epoch 1 (snapshot v25 -> v26); all 4 workers applied worker_delay=0.03 at config version 1; a known event reached a subscribed socket (partition 1, offset 83); foreign and missing origins refused; nothing was left running
+PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 128 to 230; 4 counters, 237 last-page values; rows written to smoke_7656670c; 4 workers, 238 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; API on port 57817 read back the Redis, Cassandra and ZooKeeper sentinels and states its 404 and 422 contracts; leader …-30351 wrote again at epoch 1 (snapshot v26 -> v27); all 4 workers applied worker_delay=0.03 at config version 1; a known event reached a subscribed socket (partition 1, offset 82); foreign and missing origins refused; nothing was left running
+PASS  flink windows: job 5d6d7cb7 counted {'/docs': 12, '/pricing': 8} in window 2026-10-09T15:34:50Z on its own topics; 1 checkpoint(s) completed; cancelled
 
-all 4 checks passed in 19.0s
+all 5 checks passed in 26.8s
 ```
+
+The Flink check is isolated the same way: topics, consumer group and job of its
+own, cancelled afterwards by the job id it captured — never by a name a reader's
+job could share. When a submission's outcome is uncertain (a timeout is not a
+rejection), it reconciles by the run's own unique job name, cancels whatever it
+finds by id, and deletes its topics only once every job of the run is confirmed
+stopped — never the inputs underneath a job that might still run. Finding
+nothing is not confirmation: the `flink run` inside the container can outlive
+the client that gave up on it, so after twenty seconds without a job the topics
+stay, and the check says so. A job that stopped by itself is not cancelled —
+Flink refuses to cancel a stopped job — but it does fail the check, because a
+streaming job should not stop. Eight task slots leave room for it beside a
+reader's job.
+It sends events with controlled times into one window on all four partitions,
+then advancement records on every partition beyond the window's end *plus* the
+watermark delay, with idleness disabled so closure never depends on a
+processing-time timeout; it requires exact counts and at least one completed
+checkpoint, because correct output and `RUNNING` can both come before any
+checkpoint, and an unwritable checkpoint directory would otherwise pass.
 
 On a brand new cluster you will also see `NotCoordinatorError` once or twice
 above these lines, for the same reason a first consumer does: Kafka is creating
@@ -1513,7 +1748,8 @@ published only after both tag workflows pass.
 ## Project structure
 
 ```text
-docker-compose.yml       Kafka (KRaft), Redis, Cassandra, RabbitMQ, ZooKeeper
+docker-compose.yml       Kafka (KRaft), Redis, Cassandra, RabbitMQ, ZooKeeper, Flink
+flink.Dockerfile         the Flink image, pinned by digest, connector by hash
 cassandra_schema.cql     the keyspace and table, applied by create-schema
 src/pipeline/
     __init__.py          logging setup and connection retry
@@ -1535,6 +1771,10 @@ src/pipeline/
     cluster.py           creates the coordination tree, and inspects it
     runtime_config.py    settings that can change while a process runs
     failover_demo.py     the two-leaders demonstration
+    flink_job.py         the Flink job: event-time windows, as Flink SQL
+    flink_cluster.py     submitting to Flink and reading its REST API
+    flink_jobs.py        flink-job: submit, status, cancel by id
+    windows.py           prints the latest windowed counts
     api.py               the HTTP API: one endpoint per store, bounded reads
     bulkhead.py          per-store admission, worker allowance and deadline
     notifications.py     what the consumer announces, and the best-effort publish

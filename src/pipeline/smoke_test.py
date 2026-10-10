@@ -28,12 +28,14 @@ from pipeline import (
     cassandra_store,
     coordination,
     ensure_topic,
+    flink_cluster,
     get_partition,
     jobs_queue,
     redis_store,
     wait_for_topic,
 )
 from pipeline.config import KAFKA_PARTITIONS, KAFKA_SERVER
+from pipeline.flink_job import Settings as FlinkSettings
 from pipeline.schema import SCHEMA_FILE
 from pipeline.topology_runner import (
     COMMAND_TIMEOUT_SECONDS,
@@ -1135,11 +1137,281 @@ def _leader_is_working(root: str, first: dict) -> tuple[bool, str]:
     return False, "the leader did not write a second snapshot at the same epoch"
 
 
+FLINK_TIMEOUT_SECONDS = 150
+FLINK_WINDOW_SECONDS = 10
+FLINK_WATERMARK_DELAY_SECONDS = 2
+
+# One user per partition under the routing rule (a-g, h-m, n-t, u-z), so every
+# partition carries events and every partition's watermark must advance.
+FLINK_USERS = ("ada", "hal", "ned", "uma")
+FLINK_EXPECTED = {"/docs": 3, "/pricing": 2}  # per partition, so x4 in total
+
+
+def _flink_events(window_start: int) -> tuple[list[tuple[int, dict]], dict[str, int]]:
+    """Deterministic events in one window, then advancement past its closure.
+
+    The advancement records sit comfortably beyond window end *plus* the
+    watermark delay on every partition: past the window's end is not enough,
+    because the watermark trails the newest event by the delay.
+    """
+    events, n = [], 0
+    for user in FLINK_USERS:
+        partition = get_partition(user, KAFKA_PARTITIONS)
+        for page, count in FLINK_EXPECTED.items():
+            for _ in range(count):
+                n += 1
+                events.append(
+                    (
+                        partition,
+                        {
+                            "event_id": f"smoke-flink-{n}",
+                            "user_id": user,
+                            "page": page,
+                            "timestamp": window_start + 1 + n % 8,
+                        },
+                    )
+                )
+    beyond = window_start + FLINK_WINDOW_SECONDS + FLINK_WATERMARK_DELAY_SECONDS + 5
+    for user in FLINK_USERS:
+        n += 1
+        events.append(
+            (
+                get_partition(user, KAFKA_PARTITIONS),
+                {
+                    "event_id": f"smoke-flink-{n}",
+                    "user_id": user,
+                    "page": "/advance",
+                    "timestamp": beyond,
+                },
+            )
+        )
+    expected = {
+        page: count * len(FLINK_USERS) for page, count in FLINK_EXPECTED.items()
+    }
+    return events, expected
+
+
+def _wait_for(condition, deadline: float, clock=time.monotonic) -> bool:
+    while clock() < deadline:
+        if condition():
+            return True
+        time.sleep(1)
+    return False
+
+
+# After an uncertain submission, how long to keep looking for a job that may
+# still be on its way: killing `docker compose exec` need not stop the `flink
+# run` inside the container, which can submit after the client gave up.
+FLINK_RECONCILE_SECONDS = 20
+
+
+def _flink_stop(job_id: str, clock) -> tuple[str, str]:
+    """Stop one job: (an error or empty, the state it had already stopped in).
+
+    Any stopped state will do, not only CANCELED: a job that failed by itself
+    reads nothing more. And Flink refuses to cancel a job that has already
+    stopped, so the state is read first, and again if a cancel is refused.
+    """
+    try:
+        state = flink_cluster.job_state(job_id)
+        if state in flink_cluster.TERMINAL:
+            return "", state
+        try:
+            flink_cluster.cancel(job_id)
+        except flink_cluster.FlinkError as error:
+            state = flink_cluster.job_state(job_id)
+            if state in flink_cluster.TERMINAL:
+                return "", state  # it stopped by itself in between
+            return f"could not cancel job {job_id}: {error}", ""
+        if not _wait_for(
+            lambda: flink_cluster.job_state(job_id) in flink_cluster.TERMINAL,
+            clock() + 30,
+            clock,
+        ):
+            return f"job {job_id} did not stop after being cancelled", ""
+        return "", ""
+    except flink_cluster.FlinkError as error:
+        return f"could not stop job {job_id}: {error}", ""
+
+
+def _flink_shutdown(
+    job_name: str, job_id: str | None, uncertain: bool, clock
+) -> tuple[str, list[str]]:
+    """Stop every job this run started: (an error or empty, early stops).
+
+    Confirmed only when the run's job is known and stopped. Known means its
+    captured id, or a job found under the run's unique name — which only this
+    run uses, unlike a reader's `pageview-windows`; one `flink run` submits one
+    job, so finding it accounts for the submission. An uncertain submission
+    with nothing found stays unconfirmed however long we look, because the
+    submitter inside the container may still be running.
+
+    The name is looked up even when the id is known, every known job is
+    stopped even when a lookup fails, and a failed lookup stays an error.
+    Listings include stopped jobs, so the last one covers all earlier ones.
+    """
+    if job_id is None and not uncertain:
+        return "", []  # nothing was submitted
+    errors, early = [], []
+    candidates = {job_id} if job_id else set()
+    look_until = clock() + (FLINK_RECONCILE_SECONDS if uncertain else 0)
+    while True:
+        try:
+            candidates |= set(flink_cluster.jobs_named(job_name))
+            listing_error = ""
+        except flink_cluster.FlinkError as error:
+            listing_error = f"could not list jobs named {job_name}: {error}"
+        if (candidates and not listing_error) or clock() >= look_until:
+            break
+        time.sleep(1)
+    if listing_error:
+        errors.append(listing_error)
+    if not candidates:
+        errors.append(
+            f"no job named {job_name} found within {FLINK_RECONCILE_SECONDS}s, "
+            "so its submission may still land"
+        )
+    for candidate in sorted(candidates):
+        error, state = _flink_stop(candidate, clock)
+        if error:
+            errors.append(error)
+        if state:
+            early.append(f"job {candidate[:8]} had already stopped: {state}")
+    return "; ".join(errors), early
+
+
+def flink_windows_round_trip(clock=time.monotonic) -> tuple[bool, str]:
+    """Kafka -> Flink -> Kafka, deterministic, on a job and topics of its own.
+
+    Idleness is disabled for this job, so a window closes only because the
+    events here advanced every partition's watermark — never because a
+    processing-time timeout fired, which would make the check a race. And one
+    completed checkpoint is required: correct output and RUNNING can both happen
+    before any checkpoint, so an unwritable checkpoint directory would otherwise
+    pass unnoticed.
+
+    Every path ends in the same place: reconcile and cancel, then remove the
+    topics only if every job of this run is confirmed stopped — never delete the
+    inputs underneath a job whose shutdown is unconfirmed — and report both the
+    check's failure and the shutdown's, if there are two.
+    """
+    run_id = uuid.uuid4().hex[:8]
+    source, sink = f"smoke_flink_in_{run_id}", f"smoke_flink_out_{run_id}"
+    job_name = f"smoke-flink-{run_id}"
+    job_id: str | None = None
+    uncertain = False
+    observed: tuple[bool, str] = (False, "not run")
+    deadline = clock() + FLINK_TIMEOUT_SECONDS
+    try:
+        ensure_topic(source, KAFKA_PARTITIONS, KAFKA_SERVER)
+        ensure_topic(sink, KAFKA_PARTITIONS, KAFKA_SERVER)
+        # Uncertain from the moment the submission starts until it says
+        # otherwise: whatever escapes it may have left a job behind.
+        uncertain = True
+        try:
+            job_id = flink_cluster.submit(
+                FlinkSettings(
+                    source_topic=source,
+                    sink_topic=sink,
+                    group=f"smoke-flink-{run_id}",
+                    job_name=job_name,
+                    window_seconds=FLINK_WINDOW_SECONDS,
+                    watermark_delay_seconds=FLINK_WATERMARK_DELAY_SECONDS,
+                    idle_timeout_seconds=0,
+                    checkpoint_seconds=2,
+                )
+            )
+            uncertain = False
+        except flink_cluster.SubmissionUncertain as error:
+            observed = (False, f"submission uncertain: {error}")
+        except flink_cluster.FlinkError:
+            uncertain = False  # the command never ran: nothing was submitted
+            raise
+        if job_id is not None:
+            observed = _flink_observe(job_id, source, sink, deadline, clock)
+    except (flink_cluster.FlinkError, KafkaError, OSError, ValueError) as error:
+        observed = (False, f"Flink round trip failed: {type(error).__name__}: {error}")
+    finally:
+        shutdown_error, early = _flink_shutdown(job_name, job_id, uncertain, clock)
+        if shutdown_error:
+            logger.warning(f"leaving {source} and {sink}: {shutdown_error}")
+        else:
+            _delete_topic(source)
+            _delete_topic(sink)
+
+    passed, detail = observed
+    # A streaming job that stopped before it was cancelled is a failure even
+    # when its output was right.
+    problems = early + (
+        [f"shutdown incomplete: {shutdown_error}"] if shutdown_error else []
+    )
+    if problems:
+        failure = detail if not passed else "the check itself passed"
+        return False, "; ".join([failure, *problems])
+    return (True, f"{detail}; cancelled") if passed else observed
+
+
+def _flink_observe(
+    job_id: str, source: str, sink: str, deadline: float, clock
+) -> tuple[bool, str]:
+    """Run the round trip against a submitted job."""
+    if not _wait_for(
+        lambda: flink_cluster.job_state(job_id) == "RUNNING", deadline, clock
+    ):
+        return False, f"job {job_id} never reached RUNNING"
+
+    window_start = (
+        int(time.time()) // FLINK_WINDOW_SECONDS
+    ) * FLINK_WINDOW_SECONDS - 600
+    events, expected = _flink_events(window_start)
+    producer = KafkaProducer(bootstrap_servers=KAFKA_SERVER)
+    try:
+        for partition, event in events:
+            producer.send(source, json.dumps(event).encode(), partition=partition)
+        producer.flush(timeout=PRODUCE_TIMEOUT_SECONDS)
+    finally:
+        producer.close()
+
+    wanted = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(window_start))
+    counts: dict[str, int] = {}
+    consumer = KafkaConsumer(
+        sink,
+        bootstrap_servers=KAFKA_SERVER,
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        consumer_timeout_ms=1000,
+    )
+    try:
+        while clock() < deadline and counts != expected:
+            for message in consumer:
+                record = json.loads(message.value)
+                if record["window_start"] == wanted:
+                    counts[record["page"]] = record["views"]
+                # Checked per record, not only when the topic goes quiet: 0.9's
+                # lesson — a bound that waits for silence never expires while
+                # output keeps arriving.
+                if clock() >= deadline or counts == expected:
+                    break
+    finally:
+        consumer.close()
+    if counts != expected:
+        return False, f"window {wanted}: wanted {expected}, got {counts}"
+    if not _wait_for(
+        lambda: flink_cluster.completed_checkpoints(job_id) >= 1, deadline, clock
+    ):
+        return False, "the right counts, but no completed checkpoint"
+    return True, (
+        f"job {job_id[:8]} counted {counts} in window {wanted} on its own topics; "
+        f"{flink_cluster.completed_checkpoints(job_id)} checkpoint(s) completed"
+    )
+
+
 CHECKS: list[tuple[str, Callable[[], tuple[bool, str]]]] = [
     ("host listener", host_listener_round_trips),
     ("internal listener", internal_listener_reaches_the_same_broker),
     ("partition routing", routing_uses_every_partition),
     ("honcho topology", honcho_topology_does_the_work),
+    ("flink windows", flink_windows_round_trip),
 ]
 
 
