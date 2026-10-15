@@ -118,6 +118,11 @@ jobs:
 
       - name: Smoke test
         # Includes starting the real Procfile topology and stopping it again.
+        # And here, where no reader's job shares the jobmanager, restarting it
+        # with the keeper running: the release's central claim, checked every
+        # time rather than once by hand.
+        env:
+          SMOKE_RESTART_JOBMANAGER: "1"
         run: uv run smoke-test
 
       - name: Show container logs on failure

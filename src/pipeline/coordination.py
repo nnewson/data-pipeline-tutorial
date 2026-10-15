@@ -32,9 +32,19 @@ logger = logging.getLogger("coordination")
 
 ROLES = ("coordinator", "consumer", "worker")
 
+EMPTY_FLINK_RECORD = {"generation": 0, "epoch": None, "failures": 0, "attempts": {}}
+
 
 class StaleLeader(Exception):
     """A fenced write was rejected because its epoch is no longer current."""
+
+
+class RecordChanged(Exception):
+    """A fenced write was rejected because the record changed since it was read.
+
+    The epoch was still current, so this is not a deposed leader: the decision
+    was made on a stale read, and is made again from a fresh one.
+    """
 
 
 @dataclass(frozen=True)
@@ -78,6 +88,11 @@ class Paths:
         return f"{self.root}/registry"
 
     @property
+    def flink(self) -> str:
+        """The keeper's record: the job's desired state, and what is still owed."""
+        return f"{self.root}/flink"
+
+    @property
     def persistent_paths(self) -> list[str]:
         """Created once by initialisation, never by the processes that use them."""
         return [
@@ -88,6 +103,7 @@ class Paths:
             self.config,
             self.worker_delay,
             self.registry,
+            self.flink,
         ]
 
 
@@ -147,6 +163,9 @@ def initialise(client: KazooClient, paths: Paths, worker_delay: float) -> None:
     # Without it the first write needs a create-and-race path that behaves
     # differently from every later one, in the place correctness matters.
     _create_if_absent(client, paths.snapshot, json.dumps({"epoch": None}).encode())
+    # Likewise the keeper's record, so its first write is a versioned set too.
+    # Generation 0 is "never submitted".
+    _create_if_absent(client, paths.flink, json.dumps(EMPTY_FLINK_RECORD).encode())
 
     logger.info(f"Coordination tree ready under {paths.root}")
 
@@ -225,6 +244,63 @@ def write_snapshot(
             raise result
 
 
+def flink_record_transaction(
+    client: KazooClient,
+    paths: Paths,
+    epoch_version: int,
+    record: dict,
+    version: int,
+):
+    """The keeper's record replacement, fenced twice, ready to commit.
+
+    On the epoch, as every leader-only write is, so a deposed leader is
+    rejected; and on the record's own version, so a decision made from a stale
+    read is rejected even under the current epoch. Committed by the caller —
+    synchronously, or asynchronously so the wait need not hold anything else.
+    """
+    transaction = client.transaction()
+    transaction.check(paths.epoch, version=epoch_version)
+    transaction.set_data(paths.flink, json.dumps(record).encode(), version=version)
+    return transaction
+
+
+def flink_record_outcome(
+    results: list, paths: Paths, epoch_version: int, version: int
+) -> int:
+    """The record's new version, or why the write was rejected.
+
+    Which check failed is read from its own result: kazoo marks the failing
+    operation with its error and the others as rolled back (measured against
+    ZooKeeper 3.9).
+    """
+    epoch_result, record_result = results
+    if isinstance(epoch_result, BadVersionError):
+        raise StaleLeader(
+            f"epoch version {epoch_version} is no longer current; "
+            "another coordinator has taken leadership"
+        )
+    if isinstance(record_result, BadVersionError):
+        raise RecordChanged(f"{paths.flink} changed since version {version}")
+    for result in (epoch_result, record_result):
+        if isinstance(result, Exception):
+            raise result
+    return record_result.version
+
+
+def write_flink_record(
+    client: KazooClient,
+    paths: Paths,
+    epoch_version: int,
+    record: dict,
+    version: int,
+) -> int:
+    """Replace the keeper's record, fenced twice, and wait. Returns its new version."""
+    results = flink_record_transaction(
+        client, paths, epoch_version, record, version
+    ).commit()
+    return flink_record_outcome(results, paths, epoch_version, version)
+
+
 def _read(client: KazooClient, budget: "Budget | None", method: str, *args: Any) -> Any:
     """One kazoo read: plain and synchronous, or bounded by a budget.
 
@@ -257,6 +333,14 @@ def read_snapshot(
 ) -> tuple[dict, int]:
     """The snapshot and its znode version, so a caller can prove it advanced."""
     value, stat = _read(client, budget, "get", paths.snapshot)
+    return json.loads(value or b"{}"), stat.version
+
+
+def read_flink_record(
+    client: KazooClient, paths: Paths, budget: "Budget | None" = None
+) -> tuple[dict, int]:
+    """The keeper's record and its znode version, which a fenced write checks."""
+    value, stat = _read(client, budget, "get", paths.flink)
     return json.loads(value or b"{}"), stat.version
 
 

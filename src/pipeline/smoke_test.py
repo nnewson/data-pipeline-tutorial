@@ -18,6 +18,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
@@ -25,14 +26,18 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.sync.client import connect as websocket_connect
 
 from pipeline import (
+    api,
     cassandra_store,
     coordination,
     ensure_topic,
     flink_cluster,
     get_partition,
+    job_keeper,
     jobs_queue,
     redis_store,
     wait_for_topic,
+    windows,
+    windows_writer,
 )
 from pipeline.config import KAFKA_PARTITIONS, KAFKA_SERVER
 from pipeline.flink_job import Settings as FlinkSettings
@@ -591,6 +596,7 @@ API_ROUTES = {
     "/users/{user_id}/last-page",
     "/users/{user_id}/events",
     "/cluster",
+    "/windows",
 }
 
 
@@ -786,6 +792,338 @@ def _a_known_event_is_notified(
     )
 
 
+# --- The kept Flink job, in the topology (0.11) ------------------------------
+
+# Opt-in, and on in CI: restart the jobmanager with the keeper running. Off by
+# default locally, because the jobmanager is shared with a reader's own job.
+RESTART_JOBMANAGER = "SMOKE_RESTART_JOBMANAGER"
+WINDOW_TIMEOUT_SECONDS = 60
+RESTART_TIMEOUT_SECONDS = 150
+
+
+def _keeper_record(root: str) -> tuple[job_keeper.Record | None, int, str]:
+    """The run's keeper record and its version, or why it cannot be read."""
+    try:
+        client = coordination.connect()
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, -1, f"could not connect to ZooKeeper: {error}"
+    try:
+        raw, version = coordination.read_flink_record(
+            client, coordination.Paths(root=root)
+        )
+        return job_keeper.Record.parse(raw), version, ""
+    except Exception as error:  # noqa: BLE001 - reported, not swallowed
+        return None, -1, f"reading the keeper's record failed: {error}"
+    finally:
+        client.stop()
+        client.close()
+
+
+def _current_job(record: job_keeper.Record) -> str | None:
+    attempt = record.attempts.get(record.generation)
+    return attempt.job_id if attempt else None
+
+
+def _job_is_kept(root: str, base: str) -> tuple[bool, str]:
+    """The leader's record names a running job, of the record's generation."""
+    record, _version, error = _keeper_record(root)
+    if record is None:
+        return False, error
+    job_id = _current_job(record)
+    if record.generation == 0 or job_id is None:
+        return False, f"no recorded job yet (generation {record.generation})"
+    try:
+        state = flink_cluster.job_state(job_id)
+    except flink_cluster.FlinkError as error:
+        return False, f"job {job_id[:8]}: {error}"
+    if state != "RUNNING":
+        return False, f"job {job_id[:8]} is {state}"
+    name = job_keeper.job_name(base, record.generation)
+    return True, f"the leader keeps {name} running as {job_id[:8]}"
+
+
+def _windows_written(prefix: str) -> tuple[bool, str]:
+    try:
+        client = redis_store.connect()
+    except (OSError, redis_store.redis.RedisError) as error:
+        return False, f"could not connect to Redis: {error}"
+    try:
+        count = client.zcard(windows_writer.index_key(prefix))
+    except redis_store.redis.RedisError as error:
+        return False, f"reading Redis failed: {error}"
+    finally:
+        client.close()
+    if not count:
+        return False, f"no windows under {prefix} yet"
+    return True, f"{count} window(s) written under {prefix}"
+
+
+def _epoch(text: str) -> int:
+    """A window bound, as the job writes it (`...Z`) or as the API serves it."""
+    return int(datetime.fromisoformat(text).timestamp())
+
+
+def _expected_window(records: list[dict], start: int) -> dict[str, int]:
+    """What Redis must hold for one window, from the job's own output: the
+    newest generation's latest result per page. A newer generation replaces a
+    window whole, so pages only an older one wrote are not expected."""
+    ours = [r for r in records if _epoch(r["window_start"]) == start]
+    if not ours:
+        return {}
+    newest = max(r.get("generation", 0) for r in ours)
+    return {r["page"]: r["views"] for r in ours if r.get("generation", 0) == newest}
+
+
+def _served_window(port: int, start: int) -> tuple[dict | None, str]:
+    status, body, error = _api_get(port, "/windows?limit=20")
+    if status != 200 or not isinstance(body, dict):
+        return None, error or f"/windows answered {status}"
+    for served in body.get("windows", []):
+        if _epoch(served["start"]) == start:
+            return served, ""
+    return None, f"/windows does not hold the window at {start}"
+
+
+def _a_window_reaches_the_page(
+    port: int, windows_topic: str, clock=time.monotonic
+) -> tuple[bool, str]:
+    """A window hint on a socket, then that window over HTTP with exactly the
+    counts the job wrote for it.
+
+    The expected counts are the job's own output in the run's windows topic,
+    not an injected fixture: nothing but a working writer and API can produce
+    them, and the 0.9 known event — page /docs, a producer page — cannot
+    contaminate them. Whether Flink counts correctly is `flink windows`'s job.
+    Both sides are read afresh on each attempt, since a window's pages can land
+    in different batches.
+    """
+    origin = f"http://127.0.0.1:{port}"
+    deadline = clock() + WINDOW_TIMEOUT_SECONDS
+    try:
+        with websocket_connect(
+            f"ws://127.0.0.1:{port}/ws/pageviews", origin=origin, open_timeout=5
+        ) as socket:
+            subscribed = False
+            while not subscribed:
+                message = _receive_before(socket, deadline, clock)
+                subscribed = (
+                    message["type"] == "ready" and message["bridge"] == "subscribed"
+                ) or message["type"] == "resubscribed"
+            while True:
+                message = _receive_before(socket, deadline, clock)
+                if message["type"] == "window":
+                    break
+    except TimeoutError:
+        return False, f"no window hint within {WINDOW_TIMEOUT_SECONDS}s"
+    except (WebSocketException, OSError, ValueError, KeyError) as error:
+        return False, f"window hint check failed: {type(error).__name__}: {error}"
+
+    start = _epoch(message["window_start"])
+    detail = "never compared"
+    while clock() < deadline:
+        try:
+            snapshot = windows.read_all(windows_topic)
+        except KafkaError as error:
+            detail = f"could not read {windows_topic}: {error}"
+            time.sleep(1)
+            continue
+        expected = _expected_window(snapshot.records, start)
+        served, error = _served_window(port, start)
+        if served is not None and expected and served["counts"] == expected:
+            return True, (
+                f"window {message['window_start']} hinted on the socket and served "
+                f"over HTTP as the job wrote it: {expected}"
+            )
+        detail = error or f"served {served and served['counts']}, job wrote {expected}"
+        time.sleep(1)
+    return False, f"window {message['window_start']}: {detail}"
+
+
+def _the_job_survives_a_restart(
+    root: str, port: int, clock=time.monotonic
+) -> tuple[bool, str]:
+    """The release's central claim, with the keeper running: the jobmanager
+    restarted, and the same job back — restored, not resubmitted — then
+    counting input produced after the recovery.
+
+    An unchanged record version proves no new intent was recorded, not that no
+    earlier, authorised submission could still land.
+    """
+    deadline = clock() + RESTART_TIMEOUT_SECONDS
+    record, version, error = _keeper_record(root)
+    job_id = _current_job(record) if record else None
+    if record is None or job_id is None:
+        return False, error or "no recorded job to restart under"
+    if not _wait_for(
+        lambda: _quietly(lambda: flink_cluster.completed_checkpoints(job_id) >= 1),
+        deadline,
+        clock,
+    ):
+        return False, f"job {job_id[:8]} completed no checkpoint before the restart"
+    try:
+        subprocess.run(
+            ["docker", "compose", "restart", "flink-jobmanager"],
+            check=True,
+            capture_output=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        return False, f"could not restart the jobmanager: {error}"
+    if not _wait_for(
+        lambda: _quietly(lambda: flink_cluster.job_state(job_id) == "RUNNING"),
+        deadline,
+        clock,
+    ):
+        return False, f"job {job_id[:8]} did not come back RUNNING"
+    back_at = time.time()
+    restored = _quietly(lambda: flink_cluster.restored_checkpoint(job_id))
+    if not restored:
+        return False, f"job {job_id[:8]} is back but restored from no checkpoint"
+
+    after, after_version, error = _keeper_record(root)
+    if after is None:
+        return False, error
+    if after_version != version or _current_job(after) != job_id:
+        return False, (
+            f"the keeper recorded new intent across the restart: version "
+            f"{version} -> {after_version}, generation {record.generation} -> "
+            f"{after.generation}"
+        )
+
+    while clock() < deadline:
+        status, body, _error = _api_get(port, "/windows?limit=20")
+        fresh = [
+            w
+            for w in (body or {}).get("windows", [])
+            if status == 200 and _epoch(w["start"]) >= back_at
+        ]
+        if fresh:
+            return True, (
+                f"jobmanager restarted: job {job_id[:8]} back, restored from "
+                f"checkpoint {restored}, record unchanged at version {version}, "
+                f"and a window of post-recovery input served ({fresh[-1]['start']})"
+            )
+        time.sleep(1)
+    return False, f"job {job_id[:8]} back, but no window of post-recovery input"
+
+
+def _quietly(read):
+    """A Flink read that is false, not an exception, while Flink is away."""
+    try:
+        return read()
+    except (flink_cluster.FlinkError, KeyError, TypeError):
+        return None
+
+
+def _kept_jobs_stopped(root: str, base: str, clock=time.monotonic) -> str:
+    """Stop every job this run's keeper may have submitted, or say why not.
+
+    From the record: every attempt with an id is stopped and confirmed; every
+    attempt without one is reconciled by its own generation's name for 0.10's
+    twenty seconds, and if any is still unaccounted for, that is an error, and
+    the caller keeps the topics. Finding generation 2 never accounts for
+    generation 1. The prefix listing is a cross-check, for jobs no record names.
+    """
+    record, _version, error = _keeper_record(root)
+    if record is None:
+        return error
+    known = {g: a.job_id for g, a in record.attempts.items()}
+    unresolved = {g for g, job_id in known.items() if job_id is None}
+    look_until = clock() + (FLINK_RECONCILE_SECONDS if unresolved else 0)
+    found: dict[int, set[str]] = {}
+    listing_error = ""
+    while True:
+        try:
+            for job in flink_cluster.jobs_overview():
+                generation = job_keeper.generation_of(base, job["name"])
+                if generation is not None:
+                    found.setdefault(generation, set()).add(job["id"])
+            listing_error = ""
+        except flink_cluster.FlinkError as error:
+            listing_error = f"could not list the run's jobs: {error}"
+        if (unresolved <= set(found) and not listing_error) or clock() >= look_until:
+            break
+        time.sleep(1)
+
+    errors = [listing_error] if listing_error else []
+    candidates = {job_id for job_id in known.values() if job_id}
+    candidates |= {job_id for ids in found.values() for job_id in ids}
+    for candidate in sorted(candidates):
+        stop_error, _state = _flink_stop(candidate, clock)
+        if stop_error:
+            errors.append(stop_error)
+    for generation in sorted(unresolved - set(found)):
+        errors.append(
+            f"generation {generation} ({job_keeper.job_name(base, generation)}) "
+            f"not found within {FLINK_RECONCILE_SECONDS}s, so its submission may "
+            "still land"
+        )
+    return "; ".join(errors)
+
+
+def window_writes_follow_generations() -> tuple[bool, str]:
+    """The writer's script, against Redis itself: the rules no fake can prove.
+
+    Per window: an older generation refused once a newer one is accepted; the
+    same generation updating a page; a newer one replacing the window whole; a
+    window past its end plus retention skipped, not resurrected; the index
+    trimmed; and the API's read taking counts and generation together.
+    """
+    prefix = f"smoke:windows:{uuid.uuid4().hex[:8]}:"
+    try:
+        client = redis_store.connect()
+    except (OSError, redis_store.redis.RedisError) as error:
+        return False, f"could not connect to Redis: {error}"
+    now = time.time()
+    start = int(now) // 10 * 10 - 60
+    old = start - 7200
+
+    def window(views: int, generation: int, page: str = "/docs", at: int = start):
+        return windows_writer.Result(at, at + 10, page, views, generation)
+
+    try:
+        writer = windows_writer.Writer(client, prefix=prefix, retention=3600)
+        steps = [
+            (
+                [window(3, 2), window(1, 2, "/pricing")],
+                [1, 1],
+                {"/docs": 3, "/pricing": 1},
+                2,
+            ),
+            ([window(9, 1)], [0], {"/docs": 3, "/pricing": 1}, 2),
+            ([window(4, 2)], [1], {"/docs": 4, "/pricing": 1}, 2),
+            ([window(5, 3)], [1], {"/docs": 5}, 3),
+            ([window(1, 3, at=old)], [-1], {"/docs": 5}, 3),
+        ]
+        for results, outcomes, counts, generation in steps:
+            got = writer.write(results)
+            served = api.read_windows(client, prefix, 20, time.time(), retention=3600)
+            if got != outcomes or [(w["counts"], w["generation"]) for w in served] != [
+                (counts, generation)
+            ]:
+                return False, (
+                    f"writing {results} gave {got} and served {served}; wanted "
+                    f"{outcomes} and {counts} at generation {generation}"
+                )
+        if client.exists(windows_writer.window_key(old, prefix)):
+            return False, "a window past its retention was resurrected"
+        client.zadd(windows_writer.index_key(prefix), {str(old): old})
+        writer.write([window(6, 3)])
+        if client.zscore(windows_writer.index_key(prefix), str(old)) is not None:
+            return False, "an expired window stayed in the index after a write"
+    except redis_store.redis.RedisError as error:
+        return False, f"Redis failed: {error}"
+    finally:
+        try:
+            redis_store.clear(client, prefix)
+        finally:
+            client.close()
+    return True, (
+        "older generation refused, same updated, newer replaced the window "
+        "whole, an expired window skipped and trimmed — in Redis itself"
+    )
+
+
 def honcho_topology_does_the_work() -> tuple[bool, str]:
     """Run the real Procfile topology and assert it does its job.
 
@@ -805,6 +1143,8 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     keyspace = f"smoke_{run_id}"
     queue = f"smoke_jobs_{run_id}"
     root = f"/smoke_{run_id}"
+    windows_topic = f"smoke_windows_{run_id}"
+    job_base = f"smoke-topology-{run_id}"
     api_port = _free_port()
     sentinels = Sentinels.for_run(run_id)
 
@@ -822,6 +1162,14 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
             "CONSUMER_CRASH_AFTER": "",
             "WORKER_DELAY_SECONDS": "0.02",
             "SNAPSHOT_INTERVAL_SECONDS": "0.5",
+            # The Flink job the leader keeps, on topics and a name of this
+            # run's own: generations are named `smoke-topology-<run>-g<n>`.
+            "KAFKA_WINDOWS_TOPIC": windows_topic,
+            "WINDOWS_WRITER_GROUP": f"smoke-windows-{run_id}",
+            "FLINK_JOB_BASE": job_base,
+            "FLINK_GROUP": f"smoke-flink-{run_id}",
+            "FLINK_CHECKPOINT_SECONDS": "2",
+            "FLINK_KEEPER_INTERVAL_SECONDS": "1",
             # The server binds this port itself: the API runs inside the run's
             # environment, reading its prefix, keyspace and root.
             "API_PORT": str(api_port),
@@ -834,7 +1182,9 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
     first_snapshot: dict = {}
 
     try:
-        setup_error = _prepare_topology(topic, keyspace, root, prefix, sentinels)
+        setup_error = _prepare_topology(
+            [topic, windows_topic], keyspace, root, prefix, sentinels
+        )
         if setup_error:
             observed = (False, setup_error)
         else:
@@ -851,6 +1201,7 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                         root,
                         first_snapshot,
                         api=(api_port, sentinels),
+                        flink=job_base,
                     ),
                     timeout=TOPOLOGY_SETTLE_SECONDS,
                 )
@@ -865,18 +1216,56 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
                             api_port, topic, run_id
                         )
                         detail = f"{detail}; {live_detail}"
+                    if working:
+                        working, window_detail = _a_window_reaches_the_page(
+                            api_port, windows_topic
+                        )
+                        detail = f"{detail}; {window_detail}"
+                    if working and os.environ.get(RESTART_JOBMANAGER) == "1":
+                        working, restart_detail = _the_job_survives_a_restart(
+                            root, api_port
+                        )
+                        detail = f"{detail}; {restart_detail}"
                     observed = (working, f"{readiness_detail}; {detail}")
     finally:
+        flink_error, stopped_cleanly = "", True
         if started:
             stopped, shutdown_error = topology.stop()
             if not stopped and not shutdown_error:
                 shutdown_error = "the topology did not stop"
-        # Only after the processes have gone: a live one would write it back.
-        _clear_redis_prefix(prefix)
-        _drop_keyspace(keyspace)
-        _delete_queue(queue)
-        _delete_zookeeper_root(root)
-        _delete_topic(topic)
+            stopped_cleanly = stopped and not shutdown_error
+            if stopped_cleanly:
+                # The job outlives the leader by design — it is the pipeline's —
+                # so it is stopped here, once nothing can submit another.
+                flink_error = _kept_jobs_stopped(root, job_base)
+        if not stopped_cleanly:
+            # A process that may still run may still use every resource the run
+            # made — and a coordinator may still submit — so reconciliation
+            # would not be final, and nothing is removed.
+            kept = (
+                f"left in place for processes that may still run: {prefix}, "
+                f"{keyspace}, {queue}, {root}, {topic}, {windows_topic}"
+            )
+            logger.warning(kept)
+            shutdown_error = f"{shutdown_error}; {kept}"
+        else:
+            # Only after the processes have gone: a live one would write it back.
+            _clear_redis_prefix(prefix)
+            _drop_keyspace(keyspace)
+            _delete_queue(queue)
+            if flink_error:
+                # Never the inputs underneath a job whose shutdown is unconfirmed —
+                # 0.10's rule, for every generation the run's keeper may have
+                # submitted — nor the record that says what is still owed.
+                kept = f"kept {root}, {topic} and {windows_topic} for reconciliation"
+                logger.warning(f"{kept}: {flink_error}")
+                shutdown_error = "; ".join(
+                    filter(None, [shutdown_error, flink_error, kept])
+                )
+            else:
+                _delete_zookeeper_root(root)
+                _delete_topic(topic)
+                _delete_topic(windows_topic)
 
     # Shutdown outranks the observation: a check that leaves the topology
     # running, or cannot tell whether it did, has not finished its job.
@@ -889,11 +1278,12 @@ def honcho_topology_does_the_work() -> tuple[bool, str]:
 
 
 def _prepare_topology(
-    topic: str, keyspace: str, root: str, prefix: str, sentinels: Sentinels
+    topics: list[str], keyspace: str, root: str, prefix: str, sentinels: Sentinels
 ) -> str:
     """Create everything the topology expects to already exist."""
     try:
-        ensure_topic(topic, KAFKA_PARTITIONS, KAFKA_SERVER)
+        for topic in topics:
+            ensure_topic(topic, KAFKA_PARTITIONS, KAFKA_SERVER)
     except (KafkaError, OSError, RuntimeError) as error:
         return f"create-topics path failed: {error}"
 
@@ -922,6 +1312,7 @@ def _readiness(
     root: str,
     first_snapshot: dict,
     api: tuple[int, Sentinels] | None = None,
+    flink: str | None = None,
 ) -> list[tuple[str, object]]:
     """Everything that must hold before the topology counts as working.
 
@@ -1058,6 +1449,9 @@ def _readiness(
         ("rabbitmq", rabbit_workers),
         ("zookeeper", one_leader),
     ]
+    if flink is not None:
+        predicates.append(("flink", lambda: _job_is_kept(root, flink)))
+        predicates.append(("windows", lambda: _windows_written(prefix)))
     if api is not None:
         port = api[0]
         predicates.append(
@@ -1213,7 +1607,11 @@ def _flink_stop(job_id: str, clock) -> tuple[str, str]:
     stopped, so the state is read first, and again if a cancel is refused.
     """
     try:
-        state = flink_cluster.job_state(job_id)
+        try:
+            state = flink_cluster.job_state(job_id)
+        except flink_cluster.NotFound:
+            # No runner and no archived copy: ended before a jobmanager restart.
+            return "", "NOT FOUND"
         if state in flink_cluster.TERMINAL:
             return "", state
         try:
@@ -1410,6 +1808,7 @@ CHECKS: list[tuple[str, Callable[[], tuple[bool, str]]]] = [
     ("host listener", host_listener_round_trips),
     ("internal listener", internal_listener_reaches_the_same_broker),
     ("partition routing", routing_uses_every_partition),
+    ("window writes", window_writes_follow_generations),
     ("honcho topology", honcho_topology_does_the_work),
     ("flink windows", flink_windows_round_trip),
 ]

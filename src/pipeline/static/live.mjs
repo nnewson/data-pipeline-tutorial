@@ -4,7 +4,9 @@
 // - The tracker says what Kafka offsets can and cannot reveal about the
 //   notifications this page received.
 // - The scheduler decides when the page reads its counts again: notifications
-//   make it responsive, reconciliation keeps it correct.
+//   make it responsive, reconciliation keeps it correct. The page runs two —
+//   one for the page counts, one for the Flink job's windows.
+// - windowRows shapes the windows for their table.
 
 /**
  * Track notifications per partition by offset.
@@ -178,4 +180,28 @@ export function createScheduler({
     },
     lastSuccessAt: () => lastSuccessAt,
   };
+}
+
+/**
+ * Rows for the Windows table, from a `/windows` response.
+ *
+ * Newest window first, pages in a stable order, and each window's generation
+ * kept beside it: a reader watching a replay should see a window's counts
+ * change *with* its generation, never without it. A row shows what has
+ * arrived — Flink sends no end-of-window marker, so a window fills in as its
+ * pages land — and its total is of those pages only.
+ */
+export function windowRows(windows) {
+  return [...windows]
+    .sort((a, b) => Date.parse(b.start) - Date.parse(a.start))
+    .map((w) => {
+      const pages = Object.entries(w.counts).sort(([a], [b]) => a.localeCompare(b));
+      return {
+        start: w.start,
+        end: w.end,
+        generation: w.generation,
+        pages,
+        total: pages.reduce((sum, [, views]) => sum + views, 0),
+      };
+    });
 }

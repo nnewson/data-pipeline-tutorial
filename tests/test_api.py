@@ -57,6 +57,8 @@ class FakeRedis:
         self.fail: Exception | None = None
         self.closed = False
         self.calls = 0
+        self.transactions: list[bool] = []
+        self.before_execute = None
 
     def _call(self):
         self.calls += 1
@@ -74,8 +76,37 @@ class FakeRedis:
         self._call()
         return self.data.get(key)
 
+    # The windows: a sorted set of starts, and a hash per window and its meta.
+    def zrevrangebyscore(self, key, high, low, start=0, num=None):
+        self._call()
+        assert high == "+inf" and low.startswith("("), "an exclusive lower bound"
+        floor = float(low[1:])
+        members = sorted(
+            (m for m, score in self.data.get(key, {}).items() if score > floor),
+            key=lambda m: -self.data[key][m],
+        )
+        return members[start : start + num if num is not None else None]
+
+    def pipeline(self, transaction=True):
+        self.transactions.append(transaction)
+        return FakePipeline(self)
+
     def close(self):
         self.closed = True
+
+
+class FakePipeline:
+    def __init__(self, redis):
+        self.redis, self.queued = redis, []
+
+    def hgetall(self, key):
+        self.queued.append(key)
+
+    def execute(self):
+        self.redis._call()
+        if self.redis.before_execute:
+            self.redis.before_execute()
+        return [dict(self.redis.data.get(key, {})) for key in self.queued]
 
 
 class FakeSession:
@@ -451,8 +482,9 @@ def test_openapi_documents_every_route_and_its_failures(client):
         "/users/{user_id}/last-page",
         "/users/{user_id}/events",
         "/cluster",
+        "/windows",
     }
-    for path in ("/counts/pages", "/users/{user_id}/events", "/cluster"):
+    for path in ("/counts/pages", "/users/{user_id}/events", "/cluster", "/windows"):
         assert "503" in spec["paths"][path]["get"]["responses"]
     assert "404" in spec["paths"]["/users/{user_id}/last-page"]["get"]["responses"]
     assert "Replay-sensitive" in json.dumps(spec)
@@ -761,3 +793,127 @@ def test_shutdown_closes_the_live_path(stores):
     with TestClient(app):
         assert closed == []
     assert closed == [stores.prefix]
+
+
+# --- /windows -------------------------------------------------------------------
+
+NOW = 1_791_000_000.0
+
+
+def window(redis_data, start, counts, generation=2, length=10):
+    index = f"{PREFIX}windows"
+    redis_data.setdefault(index, {})[str(start)] = start
+    redis_data[f"{PREFIX}windows:{start}"] = {p: str(v) for p, v in counts.items()}
+    redis_data[f"{PREFIX}windows:{start}:meta"] = {
+        "generation": str(generation),
+        "end": str(start + length),
+    }
+
+
+@pytest.fixture
+def windows_client(monkeypatch):
+    stores = make_stores()
+    data = stores.redis.data  # written into directly: the fake copies its input
+    clock = [NOW]
+    monkeypatch.setattr(api, "now", lambda: datetime.fromtimestamp(clock[0], api.UTC))
+    with TestClient(make_app(open_stores=lambda stack: stores)) as client:
+        yield client, stores, data, clock
+
+
+def test_windows_are_served_newest_first_with_generation_and_counts(windows_client):
+    client, stores, data, _clock = windows_client
+    window(data, int(NOW) - 30, {"/docs": 3, "/pricing": 1})
+    window(data, int(NOW) - 20, {"/docs": 5}, generation=3)
+
+    body = client.get("/windows?limit=5").json()
+
+    assert [w["counts"] for w in body["windows"]] == [
+        {"/docs": 5},
+        {"/docs": 3, "/pricing": 1},
+    ]
+    assert [w["generation"] for w in body["windows"]] == [3, 2]
+    first = body["windows"][0]
+    assert is_utc_iso(first["start"]) and is_utc_iso(first["end"])
+    assert body["retention_seconds"] == api.WINDOW_RETENTION_SECONDS
+    # Counts and generation together: one MULTI/EXEC.
+    assert stores.redis.transactions == [True]
+
+
+def test_the_limit_is_bounded_and_respected(windows_client):
+    client, _stores, data, _clock = windows_client
+    for n in range(5):
+        window(data, int(NOW) - 10 * (n + 1), {"/docs": n})
+
+    assert len(client.get("/windows?limit=2").json()["windows"]) == 2
+    assert client.get("/windows?limit=21").status_code == 422
+    assert client.get("/windows?limit=0").status_code == 422
+
+
+def test_an_expired_window_is_excluded_though_the_index_still_lists_it(
+    windows_client,
+):
+    """Trimming happens only when something is written: with traffic stopped,
+    the index outlives its windows, so the cutoff applies at read time."""
+    client, _stores, data, clock = windows_client
+    start = int(NOW) - 30
+    window(data, start, {"/docs": 3})
+    assert len(client.get("/windows").json()["windows"]) == 1
+
+    # No new writes; time passes the window's end plus retention.
+    clock[0] = start + 10 + api.WINDOW_RETENTION_SECONDS
+
+    assert client.get("/windows").json()["windows"] == []
+
+
+def test_a_window_that_vanishes_between_the_index_and_the_fetch_is_skipped(
+    windows_client,
+):
+    client, stores, data, _clock = windows_client
+    window(data, int(NOW) - 30, {"/docs": 3})
+    window(data, int(NOW) - 20, {"/docs": 5})
+
+    def expire_one():
+        data.pop(f"{PREFIX}windows:{int(NOW) - 20}")
+
+    stores.redis.before_execute = expire_one
+
+    body = client.get("/windows").json()
+
+    assert [w["counts"] for w in body["windows"]] == [{"/docs": 3}]
+
+
+def test_windows_are_unavailable_not_empty_when_redis_fails(windows_client):
+    client, stores, _data, _clock = windows_client
+    stores.redis.fail = redis.ConnectionError("down")
+
+    response = client.get("/windows")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "redis unavailable"}
+
+
+def test_the_cluster_shows_the_keepers_record_and_its_tenures_observation():
+    paths = Paths(root=ROOT)
+    nodes = cluster_nodes()
+    nodes[paths.flink] = json.dumps(
+        {
+            "generation": 2,
+            "epoch": 2,
+            "failures": 1,
+            "attempts": {
+                "1": {"job_id": None, "submitted_at": None},
+                "2": {"job_id": "b" * 32, "submitted_at": None},
+            },
+        }
+    ).encode()
+    nodes[paths.snapshot] = snapshot(
+        2, flink={"status": "running", "generation": 2, "job_id": "b" * 32}
+    )
+    with TestClient(
+        make_app(open_stores=lambda stack: make_stores(nodes=nodes))
+    ) as client:
+        body = client.get("/cluster").json()
+
+    assert body["flink"]["generation"] == 2
+    assert body["flink"]["attempts"]["1"]["job_id"] is None  # still owed
+    assert body["snapshot"]["flink"]["status"] == "running"

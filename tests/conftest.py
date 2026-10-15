@@ -17,6 +17,7 @@ from pipeline import (
     kafka_consumer,
     producer,
     redis_store,
+    windows_writer,
 )
 
 
@@ -40,6 +41,7 @@ CONNECTING_MODULES = (
     producer,
     kafka_consumer,
     coordination,
+    windows_writer,
 )
 
 
@@ -115,7 +117,16 @@ def no_real_connections(request, monkeypatch):
 # Lives here rather than in one test module because `tests` is not a package,
 # so modules cannot import from each other.
 
-from kazoo.exceptions import BadVersionError, NodeExistsError, NoNodeError  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from kazoo.exceptions import (  # noqa: E402
+    BadVersionError,
+    NodeExistsError,
+    NoNodeError,
+    RolledBackError,
+    RuntimeInconsistency,
+)
+from kazoo.handlers.threading import KazooTimeoutError  # noqa: E402
 
 
 class FakeStat:
@@ -125,6 +136,8 @@ class FakeStat:
 
 class FakeClient:
     """Enough ZooKeeper to exercise the logic, with failures on demand."""
+
+    handler = SimpleNamespace(timeout_exception=KazooTimeoutError)
 
     def __init__(self):
         self.data: dict[str, bytes] = {}
@@ -191,26 +204,51 @@ class FakeClient:
 
 
 class FakeTransaction:
+    """Operations in order, all or nothing, with kazoo's result shapes.
+
+    Measured against ZooKeeper 3.9: a failed transaction marks the failing
+    operation with its error, earlier ones RolledBackError and later ones
+    RuntimeInconsistency; a successful one returns True for a check and a stat
+    for a set.
+    """
+
     def __init__(self, client):
         self._client = client
-        self._checks = []
-        self._sets = []
+        self._ops = []
 
     def check(self, path, version):
-        self._checks.append((path, version))
+        self._ops.append(("check", path, None, version))
 
-    def set_data(self, path, value):
-        self._sets.append((path, value))
+    def set_data(self, path, value, version=-1):
+        self._ops.append(("set", path, value, version))
 
     def commit(self):
-        for path, version in self._checks:
-            if self._client.versions.get(path) != version:
+        for index, (_kind, path, _value, version) in enumerate(self._ops):
+            current = self._client.versions.get(path)
+            if version != -1 and current != version:
                 # kazoo returns results; it does not raise for every failure.
-                return [BadVersionError(path), RuntimeError("rolled back")]
-        for path, value in self._sets:
-            self._client.data[path] = value
-            self._client.versions[path] += 1
-        return [True for _ in self._checks + self._sets]
+                return [
+                    RolledBackError()
+                    if i < index
+                    else BadVersionError(path)
+                    if i == index
+                    else RuntimeInconsistency()
+                    for i in range(len(self._ops))
+                ]
+        results = []
+        for kind, path, value, _version in self._ops:
+            if kind == "check":
+                results.append(True)
+            else:
+                self._client.data[path] = value
+                self._client.versions[path] += 1
+                results.append(FakeStat(self._client.versions[path]))
+        return results
+
+    def commit_async(self):
+        """Committed at once; the result is waited for as kazoo's would be."""
+        results = self.commit()
+        return SimpleNamespace(get=lambda block=True, timeout=None: results)
 
 
 @pytest.fixture

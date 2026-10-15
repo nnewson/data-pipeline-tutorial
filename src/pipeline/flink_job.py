@@ -17,6 +17,11 @@ Two settings that are easy to run together, and must not be:
   completed checkpoint may be written again after a restore.
 
 Consistent counts, possibly repeated output records.
+
+Every result carries the job's *generation*, the number the elected keeper
+gave this submission (0.11). It is part of the job graph, so HA restores it with
+the job, and it lets the writer refuse a superseded job's results for a window a
+newer generation has already written.
 """
 
 import os
@@ -62,6 +67,8 @@ class Settings:
     # on the records it sends and never on a processing-time timeout.
     idle_timeout_seconds: int = 10
     checkpoint_seconds: int = 10
+    # 0 for a job no keeper submitted, such as the smoke test's own.
+    generation: int = 0
 
     def __post_init__(self) -> None:
         if not BOOTSTRAP.match(self.bootstrap):
@@ -79,6 +86,9 @@ class Settings:
                 raise ValueError(f"{label} must be at least 1")
         if self.idle_timeout_seconds < 0:
             raise ValueError("idle_timeout_seconds must not be negative")
+        # Interpolated into the SQL as a number, so it must be one.
+        if type(self.generation) is not int or self.generation < 0:
+            raise ValueError("generation must be a non-negative integer")
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -96,6 +106,7 @@ class Settings:
             "watermark_delay_seconds": "FLINK_WATERMARK_DELAY_SECONDS",
             "idle_timeout_seconds": "FLINK_IDLE_TIMEOUT_SECONDS",
             "checkpoint_seconds": "FLINK_CHECKPOINT_SECONDS",
+            "generation": "FLINK_GENERATION",
         }
         values: dict = {}
         for field, variable in text.items():
@@ -197,7 +208,8 @@ CREATE TABLE pageview_windows (
     window_end STRING,
     page STRING,
     -- Quoted: VIEWS is a reserved word in Flink SQL.
-    `views` BIGINT
+    `views` BIGINT,
+    generation BIGINT
 ) WITH (
     'connector' = 'kafka',
     'topic' = {literal(settings.sink_topic)},
@@ -219,7 +231,8 @@ SELECT
     DATE_FORMAT(window_start, {ISO}) AS window_start,
     DATE_FORMAT(window_end, {ISO}) AS window_end,
     page,
-    COUNT(*) AS `views`
+    COUNT(*) AS `views`,
+    CAST({settings.generation} AS BIGINT) AS generation
 FROM TABLE(
     TUMBLE(
         TABLE valid_pageviews,

@@ -25,7 +25,8 @@ worker_2: .venv/bin/worker
 worker_3: .venv/bin/worker
 worker_4: .venv/bin/worker
 # Three coordinators competing for one leadership. Only the winner writes the
-# snapshot, and only while its epoch is still current.
+# snapshot, and only while its epoch is still current — and only the winner's
+# keeper submits, adopts or cancels the Flink job.
 coordinator_1: .venv/bin/coordinator
 coordinator_2: .venv/bin/coordinator
 coordinator_3: .venv/bin/coordinator
@@ -33,3 +34,7 @@ coordinator_3: .venv/bin/coordinator
 # --reload and no --workers, either of which would put a supervisor of its own
 # inside the one Honcho already provides.
 api: .venv/bin/api
+# One writer, its own consumer group: the Flink job's windows into Redis, where
+# the API reads them. The job itself is not here — it runs in Flink, kept by
+# the leader.
+windows_writer: .venv/bin/windows-writer
