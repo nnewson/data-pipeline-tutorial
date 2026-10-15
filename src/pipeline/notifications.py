@@ -14,6 +14,7 @@ state itself.
 import json
 import logging
 import math
+from datetime import UTC, datetime
 from typing import Any
 
 import redis
@@ -25,6 +26,9 @@ from pipeline.config import REDIS_KEY_PREFIX
 logger = logging.getLogger("notifications")
 
 CHANNEL = "events:pageviews"
+# The window hints the windows writer publishes (0.11): a second channel on the
+# API's one subscription, rather than a second shape of message on this one.
+WINDOWS_CHANNEL = "events:windows"
 
 # What the bridge will relay. Anyone who can reach Redis can publish on the
 # channel, so the shape and the size are checked, not assumed.
@@ -72,6 +76,10 @@ def channel(prefix: str = REDIS_KEY_PREFIX) -> str:
     notifications apart from another's.
     """
     return f"{prefix}{CHANNEL}"
+
+
+def windows_channel(prefix: str = REDIS_KEY_PREFIX) -> str:
+    return f"{prefix}{WINDOWS_CHANNEL}"
 
 
 def encode(event: dict, partition: int, offset: int) -> str:
@@ -129,6 +137,44 @@ def parse(raw: Any) -> dict | None:
     if not finite:
         return None
     return {"type": "pageview", **{field: value[field] for field in FIELDS}}
+
+
+WINDOW_ISO = "%Y-%m-%dT%H:%M:%SZ"
+WINDOW_FIELDS = ("window_start", "window_end")
+
+
+def _iso(seconds: int) -> str:
+    return datetime.fromtimestamp(seconds, UTC).strftime(WINDOW_ISO)
+
+
+def encode_window(start: int, end: int) -> str:
+    """The hint for one window the writer wrote: its bounds, never its counts.
+
+    A window's counts change as its pages land and as generations replace one
+    another, so the hint says only which window to read again.
+    """
+    return json.dumps({"window_start": _iso(start), "window_end": _iso(end)})
+
+
+def parse_window(raw: Any) -> dict | None:
+    """A relayable window hint, or None for anything oversized or misshapen."""
+    if not isinstance(raw, str) or len(raw.encode()) > MAX_BYTES:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    for field in WINDOW_FIELDS:
+        text = value.get(field)
+        if not isinstance(text, str):
+            return None
+        try:
+            datetime.strptime(text, WINDOW_ISO)
+        except ValueError:
+            return None
+    return {"type": "window", **{field: value[field] for field in WINDOW_FIELDS}}
 
 
 class Notifier:

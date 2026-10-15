@@ -6,7 +6,11 @@ the watermark passes its end, so the newest results trail the present by a
 window and the watermark delay, and further when a partition is quiet.
 
 At-least-once at the edge: after a restore, results since the last checkpoint
-are written again, so a window can appear more than once. The latest is shown.
+are written again, so a window can appear more than once. And since 0.11 every
+result carries its job's generation, and a superseded job's results can sit in
+the topic beside its successor's. This is the raw view, read the way the
+windows writer leaves Redis: per window the newest generation's results, and
+the latest per page within it.
 """
 
 import json
@@ -17,7 +21,7 @@ from dataclasses import dataclass
 from kafka import KafkaConsumer, TopicPartition
 from kafka.errors import KafkaError
 
-from pipeline import flink_cluster
+from pipeline import coordination, flink_cluster, job_keeper
 from pipeline.config import KAFKA_SERVER, KAFKA_WINDOWS_TOPIC
 
 logger = logging.getLogger("windows")
@@ -47,8 +51,22 @@ class Snapshot:
 
 
 def latest(records: list[dict], windows: int = SHOW_WINDOWS) -> list[dict]:
-    """The most recent `windows` windows, one result per page and window."""
-    by_key = {(r["window_start"], r["page"]): r for r in records}
+    """The most recent `windows` windows, as the writer leaves them in Redis.
+
+    The writer replaces a window *whole* when a newer generation reaches it, so
+    the generation is chosen per window first — never per page, which would show
+    a page only an older generation wrote beside its successor's — and then the
+    last result read for each page within it.
+    """
+    newest: dict[str, int] = {}
+    for r in records:
+        start = r["window_start"]
+        newest[start] = max(newest.get(start, 0), r.get("generation", 0))
+    by_key = {
+        (r["window_start"], r["page"]): r
+        for r in records
+        if r.get("generation", 0) == newest[r["window_start"]]
+    }
     starts = sorted({start for start, _ in by_key})[-windows:]
     return sorted(
         (r for (start, _), r in by_key.items() if start in starts),
@@ -116,14 +134,22 @@ def read_all(
 
 
 def running_job() -> str | None:
+    """The job the keeper last recorded as current, if any — found through its
+    record rather than by a name, which every generation changes."""
     try:
-        jobs = flink_cluster.request("/jobs/overview")["jobs"]
-    except flink_cluster.FlinkError:
+        client = coordination.connect(retries=1)
+    except Exception:  # noqa: BLE001 - the late-drop count is then unavailable
         return None
-    running = [
-        j for j in jobs if j["state"] == "RUNNING" and j["name"] == "pageview-windows"
-    ]
-    return running[0]["jid"] if running else None
+    try:
+        raw, _version = coordination.read_flink_record(client, coordination.Paths())
+    except Exception:  # noqa: BLE001 - likewise
+        return None
+    finally:
+        client.stop()
+        client.close()
+    record = job_keeper.Record.parse(raw)
+    attempt = record.attempts.get(record.generation)
+    return attempt.job_id if attempt else None
 
 
 def main() -> int:
@@ -142,7 +168,10 @@ def main() -> int:
         print(f"no windows on {KAFKA_WINDOWS_TOPIC} yet")
         return 0
     for record in latest(snapshot.records):
-        print(f"  {record['window_start']}  {record['page']:<12} {record['views']}")
+        print(
+            f"  {record['window_start']}  g{record.get('generation', 0):<3} "
+            f"{record['page']:<12} {record['views']}"
+        )
     print(
         f"\n  {len(snapshot.records)} results; "
         f"{snapshot.repeated} repeated an earlier one"

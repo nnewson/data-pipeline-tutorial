@@ -59,6 +59,19 @@
     after notifications (at most once a second), after any reconnection, and
     every 30 seconds — a refresh schedule, not a freshness guarantee.</p>
 
+  <h2>Windows</h2>
+  <table>
+    <thead><tr><th>window (UTC)</th><th>generation</th><th>pages</th><th class="n">views</th></tr></thead>
+    <tbody id="windows"></tbody>
+  </table>
+  <p class="small">Last successful read: <span id="windows-at">never</span>
+    <span id="windows-error" class="bad"></span></p>
+  <p class="small">Views per page in ten-second windows of <em>event</em> time,
+    counted by the Flink job and written to Redis by the windows writer. A
+    window fills in as its pages land — Flink sends no end-of-window marker —
+    and after a replay its counts change together with its generation. Read
+    after a window hint, after any reconnection, and every 30 seconds.</p>
+
   <h2>Notifications</h2>
   <p class="small">Per partition: <em>unseen</em> marks offsets this page has
     not received (some may still arrive late); <em>previously observed</em> is a
@@ -71,7 +84,7 @@
 </main>
 
 <script type="module">
-  import { createScheduler, createTracker } from "./live.mjs";
+  import { createScheduler, createTracker, windowRows } from "./live.mjs";
 
   const FEED_LENGTH = 50;
   const element = (id) => document.getElementById(id);
@@ -96,6 +109,44 @@
       }
     },
   });
+
+  // The second instance: the same rules, a different read.
+  const windowScheduler = createScheduler({
+    read: async () => {
+      const response = await fetch("/windows?limit=6", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return (await response.json()).windows;
+    },
+    onResult: (result) => {
+      if (result.ok) {
+        renderWindows(result.value);
+        element("windows-at").textContent = new Date(result.at).toLocaleTimeString();
+        element("windows-error").textContent = "";
+      } else {
+        element("windows-error").textContent = ` — the last read failed (${result.error.message}); retrying`;
+      }
+    },
+  });
+  const schedulers = [scheduler, windowScheduler];
+
+  function renderWindows(windows) {
+    element("windows").replaceChildren(...windowRows(windows).map((w) => {
+      const row = document.createElement("tr");
+      const cells = [
+        `${w.start.slice(11, 19)}–${w.end.slice(11, 19)}`,
+        `g${w.generation}`,
+        w.pages.map(([page, views]) => `${page} ${views}`).join(", "),
+        String(w.total),
+      ];
+      for (const [index, text] of cells.entries()) {
+        const cell = document.createElement("td");
+        cell.textContent = text;
+        if (index === 3) cell.className = "n";
+        row.append(cell);
+      }
+      return row;
+    }));
+  }
 
   // Every field came from Redis, which anyone with access can publish to, so
   // nothing is ever interpolated as HTML: textContent only.
@@ -181,14 +232,17 @@
         // the subscription unnoticed.
         if (!started) {
           started = true;
-          if (!document.hidden) scheduler.start();
+          if (!document.hidden) schedulers.forEach((s) => s.start());
         } else {
-          scheduler.request();
+          schedulers.forEach((s) => s.request());
         }
         break;
       case "pageview":
         addEvent(message, tracker.observe(message.partition, message.offset));
         scheduler.request();
+        break;
+      case "window":
+        windowScheduler.request();
         break;
       case "interrupted":
         setBridge("interrupted");
@@ -197,15 +251,16 @@
       case "resubscribed":
         setBridge("subscribed");
         addNotice(`resubscribed at ${message.resubscribed_at} (interruption detected at ${message.detected_at})`);
-        scheduler.request(); // even though this socket stayed open
+        // Even though this socket stayed open.
+        schedulers.forEach((s) => s.request());
         break;
     }
   }
 
   document.addEventListener("visibilitychange", () => {
     if (!started) return;
-    if (document.hidden) scheduler.stop();
-    else scheduler.start();
+    if (document.hidden) schedulers.forEach((s) => s.stop());
+    else schedulers.forEach((s) => s.start());
   });
 
   connect();

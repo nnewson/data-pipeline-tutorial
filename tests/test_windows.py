@@ -8,8 +8,14 @@ from kafka.errors import KafkaTimeoutError
 from pipeline import windows
 
 
-def result(start, page, views):
-    return {"window_start": start, "window_end": "", "page": page, "views": views}
+def result(start, page, views, generation=1):
+    return {
+        "window_start": start,
+        "window_end": "",
+        "page": page,
+        "views": views,
+        "generation": generation,
+    }
 
 
 def test_latest_keeps_the_newest_windows_and_one_result_each():
@@ -25,6 +31,33 @@ def test_latest_keeps_the_newest_windows_and_one_result_each():
     assert [(r["window_start"], r["page"], r["views"]) for r in shown] == [
         ("t2", "/docs", 2),
         ("t3", "/", 5),
+    ]
+
+
+def test_latest_prefers_the_newest_generation_whatever_order_it_was_read_in():
+    """A superseded job's late result must not stand in for its successor's."""
+    records = [
+        result("t1", "/docs", 12, generation=2),
+        result("t1", "/docs", 9, generation=1),  # a stray, read after
+        result("t1", "/docs", 12, generation=2),
+    ]
+
+    assert [r["views"] for r in windows.latest(records)] == [12]
+
+
+def test_a_page_only_an_older_generation_wrote_is_not_shown():
+    """The writer replaces the window whole, so the view must too."""
+    records = [
+        result("t1", "/old", 2, generation=1),
+        result("t1", "/docs", 12, generation=2),
+        result("t2", "/old", 3, generation=1),  # t2 has only generation 1
+    ]
+
+    shown = windows.latest(records)
+
+    assert [(r["window_start"], r["page"], r["generation"]) for r in shown] == [
+        ("t1", "/docs", 2),
+        ("t2", "/old", 1),
     ]
 
 

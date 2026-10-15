@@ -1,7 +1,8 @@
 """A coordinator: competes for leadership, and does the leader-only work.
 
 Several of these run. One wins. The winner writes a periodic snapshot of the
-pipeline, which 0.8 will serve over HTTP.
+pipeline, which 0.8 serves over HTTP, and — since 0.11 — keeps the Flink job in
+existence, through a keeper that works for whichever tenure is current.
 
 Why a single writer is not, on its own, a correctness argument: four
 snapshotters would be wasteful and would race to overwrite each other, which is
@@ -22,6 +23,7 @@ from kazoo.recipe.election import Election
 from pipeline import (
     cassandra_store,
     coordination,
+    job_keeper,
     jobs_queue,
     kafka_offsets,
     redis_store,
@@ -49,7 +51,9 @@ def identity() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
 
 
-def build_snapshot(redis_client, cassandra_session, offsets, epoch: int) -> dict:
+def build_snapshot(
+    redis_client, cassandra_session, offsets, epoch: int, flink: dict | None = None
+) -> dict:
     """What the leader records about the pipeline.
 
     Deliberately no Cassandra `COUNT(*)`: 0.5 documented that as a diagnostic
@@ -77,6 +81,8 @@ def build_snapshot(redis_client, cassandra_session, offsets, epoch: int) -> dict
         "queue_consumers": consumers,
         "kafka_committed": offsets.committed_total(CONSUMER_GROUP),
         "cassandra_reachable": cassandra_reachable(cassandra_session),
+        # What this tenure's keeper last saw — never an earlier tenure's.
+        "flink": flink,
     }
 
 
@@ -109,6 +115,7 @@ def lead(
     redis_client,
     cassandra_session,
     offsets,
+    keeper: job_keeper.Keeper | None = None,
 ) -> None:
     """Run leader-only work until leadership is lost or the process stops.
 
@@ -150,6 +157,11 @@ def lead(
 
     logger.info(f"Elected leader with epoch token {epoch}")
 
+    # The keeper's work for this tenure, retired on every way out below.
+    tenure = job_keeper.Tenure(epoch)
+    if keeper is not None:
+        keeper.serve(tenure)
+
     # Only a voluntary step-down removes the marker. After a lost session
     # ZooKeeper has already taken ours, and after a rejected write the successor
     # owns the replacement — deleting then would remove *their* marker.
@@ -174,7 +186,13 @@ def lead(
                     client,
                     paths,
                     epoch,
-                    build_snapshot(redis_client, cassandra_session, offsets, epoch),
+                    build_snapshot(
+                        redis_client,
+                        cassandra_session,
+                        offsets,
+                        epoch,
+                        keeper.observation(epoch) if keeper is not None else None,
+                    ),
                 )
             except StaleLeader as error:
                 # Superseded: the marker is already someone else's.
@@ -206,6 +224,9 @@ def lead(
             stop_running.wait(SNAPSHOT_INTERVAL_SECONDS)
         voluntary = True
     finally:
+        # Before anything else: the keeper must not act for a tenure that is
+        # ending, whichever way it ends.
+        tenure.retire()
         if voluntary:
             # Before Election.run() releases the contender, so the next winner
             # does not find the marker occupied.
@@ -253,6 +274,13 @@ def main() -> int:
 
         resources.callback(stop_running.set)
 
+        # One keeper for the life of the process, handed each tenure's work.
+        # Registered after the ZooKeeper client, so it stops first: once stop()
+        # returns no keeper write can start, and the client can close.
+        keeper = job_keeper.Keeper(client, paths, leadership)
+        keeper.start()
+        resources.callback(keeper.stop)
+
         logger.info(
             f"Contending for leadership as {identity()} "
             f"(negotiated session timeout "
@@ -269,6 +297,7 @@ def main() -> int:
                     redis_client,
                     cassandra_session,
                     offsets,
+                    keeper,
                 )
                 if stop_running.is_set():
                     break

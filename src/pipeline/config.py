@@ -98,3 +98,30 @@ KAFKA_WINDOWS_TOPIC = os.environ.get("KAFKA_WINDOWS_TOPIC", "pageview_windows")
 
 # Flink's REST API and dashboard, from the host.
 FLINK_REST_URL = os.environ.get("FLINK_REST_URL", "http://localhost:8081")
+
+# The keeper names each generation's job `<this>-g<n>`. The base, not the job's
+# full name: inside the container FLINK_JOB_NAME is the full name, and the
+# keeper passes it explicitly with every submission.
+FLINK_JOB_BASE = os.environ.get("FLINK_JOB_BASE", "pageview-windows")
+
+# The consumer group the job commits its offsets under, for monitoring only:
+# every generation reads from the earliest offset whatever the group holds.
+FLINK_GROUP = os.environ.get("FLINK_GROUP", "flink-pageview-windows")
+
+# What the keeper submits with. The job's own defaults, overridable so a smoke
+# run can checkpoint often enough to restart the jobmanager within its bound.
+FLINK_WINDOW_SECONDS = int(os.environ.get("FLINK_WINDOW_SECONDS", "10"))
+FLINK_CHECKPOINT_SECONDS = int(os.environ.get("FLINK_CHECKPOINT_SECONDS", "10"))
+FLINK_IDLE_TIMEOUT_SECONDS = int(os.environ.get("FLINK_IDLE_TIMEOUT_SECONDS", "10"))
+
+# How often the leader's keeper compares the record with what Flink reports.
+FLINK_KEEPER_INTERVAL_SECONDS = float(
+    os.environ.get("FLINK_KEEPER_INTERVAL_SECONDS", "5")
+)
+
+# The windows writer's own group, so it reads every partition of the windows
+# topic whatever else consumes it.
+WINDOWS_WRITER_GROUP = os.environ.get("WINDOWS_WRITER_GROUP", "windows-writer")
+
+# How long a window stays in Redis after its end, by event time.
+WINDOW_RETENTION_SECONDS = int(os.environ.get("WINDOW_RETENTION_SECONDS", "3600"))

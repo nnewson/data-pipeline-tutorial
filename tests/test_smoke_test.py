@@ -216,6 +216,7 @@ EXPECTED_CHECKS = [
     "host listener",
     "internal listener",
     "partition routing",
+    "window writes",
     "honcho topology",
     "flink windows",
 ]
@@ -532,6 +533,10 @@ def _topology_scaffold(monkeypatch, topology):
     monkeypatch.setattr(
         smoke_test, "_a_known_event_is_notified", lambda *a: (True, "notified")
     )
+    monkeypatch.setattr(
+        smoke_test, "_a_window_reaches_the_page", lambda *a: (True, "windowed")
+    )
+    monkeypatch.setattr(smoke_test, "_kept_jobs_stopped", lambda *a: "")
     for name in (
         "_clear_redis_prefix",
         "_drop_keyspace",
@@ -592,7 +597,7 @@ def test_setup_failure_still_cleans_up(monkeypatch):
 
     assert passed is False
     assert "cluster init path failed" in detail
-    assert len(cleaned) == 5
+    assert len(cleaned) == 6  # two topics now: the events and the windows
 
 
 def test_the_topology_gets_isolated_state(monkeypatch):
@@ -606,6 +611,10 @@ def test_the_topology_gets_isolated_state(monkeypatch):
     monkeypatch.setattr(
         smoke_test, "_a_known_event_is_notified", lambda *a: (True, "notified")
     )
+    monkeypatch.setattr(
+        smoke_test, "_a_window_reaches_the_page", lambda *a: (True, "windowed")
+    )
+    monkeypatch.setattr(smoke_test, "_kept_jobs_stopped", lambda *a: "")
     monkeypatch.setattr(
         smoke_test, "Topology", lambda env: (captured.update(env), FakeTopology())[1]
     )
@@ -627,6 +636,11 @@ def test_the_topology_gets_isolated_state(monkeypatch):
     assert captured["RABBITMQ_QUEUE"].startswith("smoke_jobs_")
     assert captured["ZOOKEEPER_ROOT"].startswith("/smoke_")
     assert int(captured["API_PORT"]) > 0
+    # And the kept Flink job: its topics, its name and the writer's group.
+    assert captured["KAFKA_WINDOWS_TOPIC"].startswith("smoke_windows_")
+    assert captured["WINDOWS_WRITER_GROUP"].startswith("smoke-windows-")
+    assert captured["FLINK_JOB_BASE"].startswith("smoke-topology-")
+    assert captured["FLINK_GROUP"].startswith("smoke-flink-")
 
 
 def test_everything_is_cleaned_up_when_honcho_cannot_start(monkeypatch):
@@ -652,7 +666,7 @@ def test_everything_is_cleaned_up_when_honcho_cannot_start(monkeypatch):
 
     assert passed is False
     assert "honcho is missing" in detail
-    assert len(cleaned) == 5
+    assert len(cleaned) == 6
 
 
 def test_readiness_requires_every_consumer_registered(monkeypatch):
@@ -1443,3 +1457,182 @@ def test_the_flink_bound_holds_while_output_keeps_arriving(monkeypatch):
 
     assert not passed
     assert "wanted" in detail
+
+
+# --- The kept job's teardown (0.11) ----------------------------------------------
+
+
+class KeptFlink:
+    """A cluster listing jobs by name, each with a state."""
+
+    def __init__(self, jobs):
+        self.jobs = dict(jobs)  # id -> (name, state)
+        self.cancelled: list[str] = []
+
+    def jobs_overview(self):
+        return [
+            {"id": i, "name": name, "state": state}
+            for i, (name, state) in self.jobs.items()
+        ]
+
+    def job_state(self, job_id):
+        if job_id not in self.jobs:
+            raise smoke_test.flink_cluster.NotFound("404")
+        return self.jobs[job_id][1]
+
+    def cancel(self, job_id):
+        self.cancelled.append(job_id)
+        name, _state = self.jobs[job_id]
+        self.jobs[job_id] = (name, "CANCELED")
+
+
+def _kept(monkeypatch, record, jobs):
+    flink = KeptFlink(jobs)
+    for name in ("jobs_overview", "job_state", "cancel"):
+        monkeypatch.setattr(smoke_test.flink_cluster, name, getattr(flink, name))
+    monkeypatch.setattr(
+        smoke_test,
+        "_keeper_record",
+        lambda root: (smoke_test.job_keeper.Record.parse(record), 3, ""),
+    )
+    monkeypatch.setattr(smoke_test.time, "sleep", lambda s: None)
+    return flink
+
+
+def _clock(step=5.0):
+    now = [0.0]
+
+    def clock():
+        now[0] += step
+        return now[0]
+
+    return clock
+
+
+def test_a_delayed_generation_keeps_the_topics_though_its_successor_stopped(
+    monkeypatch,
+):
+    """Generation 1 uncertain, generation 2 running: stopping 2 and listing no
+    1 must not count as accounting for 1."""
+    record = {
+        "generation": 2,
+        "attempts": {"1": {"job_id": None}, "2": {"job_id": "b" * 32}},
+    }
+    flink = _kept(monkeypatch, record, {"b" * 32: ("run-g2", "RUNNING")})
+
+    error = smoke_test._kept_jobs_stopped("/r", "run", clock=_clock())
+
+    assert flink.cancelled == ["b" * 32]
+    assert "generation 1 (run-g1)" in error
+    assert "may still land" in error
+
+
+def test_a_delayed_generation_found_by_its_own_name_is_stopped_too(monkeypatch):
+    record = {
+        "generation": 2,
+        "attempts": {"1": {"job_id": None}, "2": {"job_id": "b" * 32}},
+    }
+    flink = _kept(
+        monkeypatch,
+        record,
+        {"a" * 32: ("run-g1", "RUNNING"), "b" * 32: ("run-g2", "RUNNING")},
+    )
+
+    error = smoke_test._kept_jobs_stopped("/r", "run", clock=_clock())
+
+    assert error == ""
+    assert sorted(flink.cancelled) == ["a" * 32, "b" * 32]
+
+
+def test_a_recorded_job_flink_no_longer_knows_counts_as_stopped(monkeypatch):
+    """404: no runner and no archived copy — it ended before a restart."""
+    record = {"generation": 1, "attempts": {"1": {"job_id": "a" * 32}}}
+    _kept(monkeypatch, record, {})
+
+    assert smoke_test._kept_jobs_stopped("/r", "run", clock=_clock()) == ""
+
+
+def _recording_cleanup(monkeypatch) -> list[str]:
+    cleaned: list[str] = []
+    for name in (
+        "_clear_redis_prefix",
+        "_drop_keyspace",
+        "_delete_queue",
+        "_delete_zookeeper_root",
+        "_delete_topic",
+    ):
+        monkeypatch.setattr(
+            smoke_test, name, lambda *a, _name=name, **k: cleaned.append(_name)
+        )
+    return cleaned
+
+
+def test_an_unconfirmed_kept_job_keeps_its_topics_and_its_record(monkeypatch):
+    """The record is what explains what is still owed: it stays with the topics."""
+    _topology_scaffold(monkeypatch, FakeTopology())
+    cleaned = _recording_cleanup(monkeypatch)
+    monkeypatch.setattr(
+        smoke_test, "_kept_jobs_stopped", lambda *a: "generation 1 may still land"
+    )
+
+    passed, detail = smoke_test.honcho_topology_does_the_work()
+
+    assert passed is False
+    assert "shutdown incomplete: generation 1 may still land" in detail
+    assert "for reconciliation" in detail
+    assert "_delete_topic" not in cleaned
+    assert "_delete_zookeeper_root" not in cleaned
+    # The processes have stopped, so what only they used can go.
+    assert {"_clear_redis_prefix", "_drop_keyspace", "_delete_queue"} <= set(cleaned)
+
+
+def test_a_topology_that_did_not_stop_keeps_everything_and_reconciles_nothing(
+    monkeypatch,
+):
+    """A surviving coordinator could still submit, and its processes still use
+    every resource the run made: nothing is final, nothing is removed."""
+    _topology_scaffold(monkeypatch, FakeTopology(stop=(False, "group 42 remains")))
+    cleaned = _recording_cleanup(monkeypatch)
+    reconciled = []
+    monkeypatch.setattr(
+        smoke_test, "_kept_jobs_stopped", lambda *a: reconciled.append(a) or ""
+    )
+
+    passed, detail = smoke_test.honcho_topology_does_the_work()
+
+    assert passed is False
+    assert "group 42 remains" in detail and "left in place" in detail
+    assert cleaned == []
+    assert reconciled == []
+
+
+def test_the_expected_window_is_the_newest_generations_output_only():
+    records = [
+        {
+            "window_start": "2026-10-12T10:00:00Z",
+            "page": "/docs",
+            "views": 9,
+            "generation": 1,
+        },
+        {
+            "window_start": "2026-10-12T10:00:00Z",
+            "page": "/old",
+            "views": 2,
+            "generation": 1,
+        },
+        {
+            "window_start": "2026-10-12T10:00:00Z",
+            "page": "/docs",
+            "views": 12,
+            "generation": 2,
+        },
+        {
+            "window_start": "2026-10-12T10:00:10Z",
+            "page": "/docs",
+            "views": 4,
+            "generation": 2,
+        },
+    ]
+    start = smoke_test._epoch("2026-10-12T10:00:00Z")
+
+    assert smoke_test._expected_window(records, start) == {"/docs": 12}

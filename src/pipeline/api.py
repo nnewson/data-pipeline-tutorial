@@ -40,16 +40,25 @@ from pydantic import BaseModel, Field, StringConstraints
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
-from pipeline import cassandra_store, coordination, fanout, notifications, redis_store
+from pipeline import (
+    cassandra_store,
+    coordination,
+    fanout,
+    notifications,
+    redis_store,
+    windows_writer,
+)
 from pipeline.bridge import Bridge
 from pipeline.bridge import open_client as open_subscription_client
 from pipeline.bulkhead import Budget, Bulkhead, Busy, Unavailable
 from pipeline.config import (
     API_PORT,
     CASSANDRA_KEYSPACE,
+    FLINK_WINDOW_SECONDS,
     REDIS_HOST,
     REDIS_KEY_PREFIX,
     REDIS_PORT,
+    WINDOW_RETENTION_SECONDS,
     ZOOKEEPER_ROOT,
 )
 from pipeline.coordination import ROLES, Paths
@@ -85,6 +94,7 @@ EVENTS_LIMIT_MAX = 100
 USER_ID_MAX_LENGTH = 128
 PAGES_PER_REQUEST_MAX = 20
 PAGE_MAX_LENGTH = 128
+WINDOWS_LIMIT_MAX = 20
 
 # Fewer than the ten every pipeline process makes. A shared retry helper does
 # not need identical patience: the documented workflow already waits for the
@@ -254,6 +264,40 @@ class UserEvents(BaseModel):
     observed_at: datetime = Field(description=OBSERVED_AT)
 
 
+class Window(BaseModel):
+    start: datetime
+    end: datetime
+    generation: int = Field(
+        description=(
+            "The generation of the job whose results this window holds. A "
+            "window never moves back to an older generation than one it has "
+            "accepted; an older one can still hold a window its successor has "
+            "not written yet."
+        )
+    )
+    counts: dict[str, int] = Field(
+        description=(
+            "Views per page in this window of event time, as far as they have "
+            "arrived: Flink sends no end-of-window marker, so a window's pages "
+            "land one by one."
+        )
+    )
+
+
+class Windows(BaseModel):
+    windows: list[Window] = Field(
+        description=(
+            "Newest first. Possibly fewer than asked for: a window that expires "
+            "between reading the index and reading the window is left out, "
+            "never padded."
+        )
+    )
+    retention_seconds: int = Field(
+        description="How long a window stays after its end, by event time."
+    )
+    observed_at: datetime = Field(description=OBSERVED_AT)
+
+
 class Leader(BaseModel):
     identity: str
     epoch: int = Field(description="The fencing token this leader writes with.")
@@ -274,6 +318,41 @@ class Snapshot(BaseModel):
     queue_consumers: int | None = None
     kafka_committed: int | None = None
     cassandra_reachable: bool | None = None
+    flink: "FlinkObservation | None" = Field(
+        default=None,
+        description="What this leader's keeper last saw — never an earlier tenure's.",
+    )
+
+
+class FlinkObservation(BaseModel):
+    """The keeper's latest look at Flink, as the leader recorded it."""
+
+    status: str
+    generation: int | None = None
+    job_id: str | None = None
+    state: str | None = None
+    at: datetime | None = None
+    cancelling: list[str] = []
+    unresolved: list[int] = []
+    notes: list[str] = []
+    note: str | None = None
+
+
+class FlinkAttempt(BaseModel):
+    job_id: str | None = Field(
+        description="None until the submission's job is known: still owed."
+    )
+    submitted_at: datetime | None = None
+
+
+class FlinkRecord(BaseModel):
+    """The keeper's record: desired state, and every attempt not yet accounted for."""
+
+    version: int = Field(description="The record znode's version.")
+    generation: int = Field(description="The current generation; 0 is never submitted.")
+    epoch: int | None = Field(description="The epoch it was last written under.")
+    failures: int = Field(description="Consecutive resubmissions, for the backoff.")
+    attempts: dict[int, FlinkAttempt]
 
 
 class Registration(BaseModel):
@@ -315,6 +394,13 @@ class Cluster(BaseModel):
         )
     )
     registrations: Registrations
+    flink: FlinkRecord | None = Field(
+        default=None,
+        description=(
+            "The keeper's record, as the leader last wrote it — not Flink's "
+            "live view, which the API never asks for."
+        ),
+    )
     observed_at: datetime = Field(description=OBSERVED_AT)
 
 
@@ -362,7 +448,63 @@ def read_cluster(client: KazooClient, paths: Paths, budget: Budget) -> dict:
     registrations = {
         role: coordination.registrations(client, paths, role, budget) for role in ROLES
     }
-    return {"leader": leader, "snapshot": snapshot, "registrations": registrations}
+    try:
+        flink, version = coordination.read_flink_record(client, paths, budget)
+        flink = {**flink, "version": version}
+    except NoNodeError:
+        flink = None  # a tree from before 0.11: `cluster init` adds it
+    return {
+        "leader": leader,
+        "snapshot": snapshot,
+        "registrations": registrations,
+        "flink": flink,
+    }
+
+
+def read_windows(
+    client: redis.Redis,
+    prefix: str,
+    limit: int,
+    now: float,
+    retention: int = WINDOW_RETENTION_SECONDS,
+    window_seconds: int = FLINK_WINDOW_SECONDS,
+) -> list[dict]:
+    """The newest live windows, each read whole.
+
+    The cutoff applies here, at read time, not only when the writer trims: the
+    index is trimmed only when something is written, so with traffic stopped it
+    outlives the windows it lists. Scored by start, cut off on end plus
+    retention — exactly when a window's keys expire.
+
+    Each window's counts and generation come from one MULTI/EXEC, so a response
+    cannot label old counts with a newly advanced generation. A window that
+    expired between the two steps is skipped.
+    """
+    cutoff = int(now) - retention - window_seconds
+    starts = client.zrevrangebyscore(
+        windows_writer.index_key(prefix), "+inf", f"({cutoff}", start=0, num=limit
+    )
+    if not starts:
+        return []
+    pipe = client.pipeline(transaction=True)
+    for start in starts:
+        pipe.hgetall(windows_writer.window_key(int(start), prefix))
+        pipe.hgetall(windows_writer.meta_key(int(start), prefix))
+    replies = pipe.execute()
+    windows = []
+    for index, start in enumerate(starts):
+        counts, meta = replies[2 * index], replies[2 * index + 1]
+        if not counts or not meta:
+            continue
+        windows.append(
+            {
+                "start": int(start),
+                "end": int(meta["end"]),
+                "generation": int(meta["generation"]),
+                "counts": {page: int(views) for page, views in counts.items()},
+            }
+        )
+    return windows
 
 
 def snapshot_response(snapshot: dict | None) -> Snapshot | None:
@@ -382,6 +524,23 @@ def cluster_response(state: dict) -> Cluster:
         snapshot=snapshot_response(snapshot),
         snapshot_matches_leader=snapshot_matches_leader(leader, snapshot),
         registrations=state["registrations"],
+        flink=state.get("flink"),
+        observed_at=now(),
+    )
+
+
+def windows_response(windows: list[dict]) -> Windows:
+    return Windows(
+        windows=[
+            Window(
+                start=datetime.fromtimestamp(w["start"], UTC),
+                end=datetime.fromtimestamp(w["end"], UTC),
+                generation=w["generation"],
+                counts=w["counts"],
+            )
+            for w in windows
+        ],
+        retention_seconds=WINDOW_RETENTION_SECONDS,
         observed_at=now(),
     )
 
@@ -428,7 +587,13 @@ async def open_live(prefix: str) -> AsyncIterator[Live]:
     hub = fanout.Hub()
     client = open_subscription_client(REDIS_HOST, REDIS_PORT)
     bridge = Bridge(
-        client.pubsub, notifications.channel(prefix), hub.broadcast, hub.notice
+        client.pubsub,
+        {
+            notifications.channel(prefix): notifications.parse,
+            notifications.windows_channel(prefix): notifications.parse_window,
+        },
+        hub.broadcast,
+        hub.notice,
     )
     task = asyncio.create_task(bridge.run())
     try:
@@ -468,7 +633,7 @@ def create_app(
 
     app = FastAPI(
         title="data-pipeline-tutorial",
-        version="0.9",
+        version="0.11",
         summary="Three stores, three kinds of truth.",
         lifespan=lifespan,
     )
@@ -537,6 +702,22 @@ def create_app(
         if page is None:
             raise HTTPException(status_code=404, detail="no last page for this user")
         return LastPage(user_id=user_id, page=page, observed_at=now())
+
+    @app.get("/windows", responses=STORE_ERRORS, summary="Redis: windowed counts")
+    async def windows(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=WINDOWS_LIMIT_MAX)] = 10,
+    ) -> Windows:
+        """The Flink job's counts per page per window of event time, as the
+        windows writer put them in Redis. On the Redis bulkhead it shares with
+        the two other Redis routes: one client, one pool, one server."""
+        stores, bulkheads = state(request)
+        found = await bulkheads.redis.run(
+            lambda _budget: read_windows(
+                stores.redis, stores.prefix, limit, now().timestamp()
+            )
+        )
+        return windows_response(found)
 
     @app.get(
         "/users/{user_id}/events",

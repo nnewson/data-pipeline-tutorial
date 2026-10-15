@@ -4,18 +4,20 @@ A step-by-step rebuild of [data-pipeline](https://github.com/nnewson/data-pipeli
 released one technology at a time, with a walkthrough post for each release at
 [nnewson.dev](https://nnewson.dev).
 
-**This release: 0.10 — Flink: the job.** Stateful stream processing as a
-self-contained unit: a Flink job counting page views in ten-second windows of
-event time, from Kafka to Kafka. Event time makes the counts mean something;
-watermarks decide when a window is done; and what a restart does to the results
-is decided by checkpoints and the sink, not by the framework's name.
+**This release: 0.11 — Flink: integration.** 0.10's job wired into the system
+around it. Flink recovers *execution* — in high-availability mode a jobmanager
+that comes back brings the same job back from its last checkpoint. The elected
+coordinator reconciles *intent* — that the job should exist at all — through a
+fenced record and a generation per submission. Duplicate execution remains
+possible, so every result carries its generation into Redis, and a window there
+never moves back to an older one. The counts reach the API and the live page.
 
 ## This release
 
 ```bash
 git clone https://github.com/nnewson/data-pipeline-tutorial.git
 cd data-pipeline-tutorial
-git checkout 0.10
+git checkout 0.11
 ```
 
 ## Prerequisites
@@ -63,7 +65,8 @@ Cassandra takes 40–90 seconds to accept connections on a first start, so
 has not hung.
 
 Then start everything — a producer, four consumers, four workers, three
-coordinators, and the API:
+coordinators, the API and the windows writer. The leading coordinator also
+submits the Flink job, or adopts the one already running:
 
 ```bash
 uv run honcho start
@@ -738,7 +741,13 @@ have — and it is the obvious next thing to fix if the snapshot interval ever g
 short enough for it to matter.
 
 `/cluster` serves this snapshot over HTTP — which is why the leader exists at all
-rather than merely recording that it is the leader.
+rather than merely recording that it is the leader. Since 0.11 the snapshot also
+carries `flink`: what *this* tenure's keeper last saw. An observation is tagged
+with the epoch it was made under and served only for it, so a retired tenure's
+late report never lands in a successor's snapshot. `/cluster` also returns the
+keeper's record itself, as the leader last wrote it — never Flink's live view,
+which the API does not ask for: that would be a fourth dependency, with a
+bulkhead of its own, for values the leader already writes.
 
 ## An API over three stores
 
@@ -773,6 +782,7 @@ One endpoint, one store:
 | `GET /users/{user_id}/last-page` | Redis | **404** | 503 |
 | `GET /users/{user_id}/events?limit=` | Cassandra | `[]` | 503 |
 | `GET /cluster` | ZooKeeper | leader `null` | 503 |
+| `GET /windows?limit=` | Redis | `[]` | 503 |
 
 `/health` is liveness only: it touches no store and never waits for a thread, so
 a stalled store cannot make the process look dead when it is merely busy.
@@ -1245,22 +1255,20 @@ them.
 ## Flink: counting in event time
 
 ```bash
-uv run create-topics          # now also creates pageview_windows
-uv run flink-job submit
-uv run producer               # or the whole topology: uv run honcho start
-uv run windows
+uv run create-topics          # also creates pageview_windows
+uv run honcho start           # the leader submits the job, or adopts it
+uv run windows                # the raw view, straight from Kafka
 ```
 
 ```text
   …
-  2026-10-08T18:42:10Z  /            4
-  2026-10-08T18:42:10Z  /docs        4
-  2026-10-08T18:42:10Z  /pricing     1
-  2026-10-08T18:42:20Z  /            4
-  2026-10-08T18:42:20Z  /checkout    5
-  2026-10-08T18:42:20Z  /docs        1
+  2026-10-11T21:02:40Z  g1   /pricing     2
+  2026-10-11T21:02:50Z  g1   /            2
+  2026-10-11T21:02:50Z  g1   /checkout    3
+  2026-10-11T21:02:50Z  g1   /docs        4
+  2026-10-11T21:02:50Z  g1   /pricing     1
 
-  297 results; 0 repeated an earlier one
+  427 results; 118 repeated an earlier one
 ```
 
 While the job is running it also prints how many late records the job has
@@ -1280,8 +1288,9 @@ A Flink job reads `pageviews`, counts views per page in ten-second windows of
 **event time** — when the views happened, by the producer's timestamp, not when
 Flink processed them — and writes each window's result to `pageview_windows`.
 The dashboard is at [localhost:8081](http://localhost:8081): the job graph, each
-partition's watermark, checkpoints, backpressure. Nothing reads the results yet
-except `uv run windows`; 0.11 wires them into the live page.
+partition's watermark, checkpoints, backpressure. The windows writer puts the
+results into Redis, where `GET /windows` and the live page read them; `uv run
+windows` is the raw view, and shows each result's generation (`g1`).
 
 The job is Flink SQL, run through PyFlink, using the window table-valued
 function:
@@ -1305,8 +1314,11 @@ so submission happens inside the jobmanager container:
 docker compose exec flink-jobmanager flink run -d -py /opt/pipeline/flink_job.py
 ```
 
-`uv run flink-job submit` does exactly that; `uv run flink-job status` and
-`uv run flink-job cancel <id>` complete it. Cancel by id, never by name.
+The leader's keeper does exactly that, naming each submission
+`pageview-windows-g<n>`. There is no `flink-job submit` any more: a job started
+by hand would run beside the keeper's and write the same windows. `uv run
+flink-job status` shows the keeper's record and Flink's view of it, and `uv run
+flink-job cancel <id>` cancels one job — by id, never by name.
 
 **Every submission starts from the beginning of the topic** and writes every
 window again, so cancelling and resubmitting repeats earlier results on
@@ -1314,8 +1326,8 @@ window again, so cancelling and resubmitting repeats earlier results on
 fresh job that resumed from the consumer group's committed offsets instead
 would start past events whose windows were still open, with none of their
 partial counts, and emit those windows short — silently. Restoring state and
-offsets *together* needs a retained checkpoint and an explicit restore, which is
-0.11's submitter; this release does not pretend a resubmission can do it.
+offsets *together* is what high availability does after a failure (below); a
+deliberate cancel starts over.
 
 ## Watermarks: when is a window done?
 
@@ -1409,27 +1421,306 @@ that checkpoint 20.9s later and wrote the same result again.
 | write | on recovery |
 |---|---|
 | Flink window result → Kafka (exactly-once state, at-least-once sink) | results since the last checkpoint written again; identical when the same events are accepted, which the timing policy does not guarantee |
+| Flink job, jobmanager restarted (HA, 0.11) | the same job and generation, from its last checkpoint: state and offsets together |
+| Flink job, ZooKeeper unreachable long enough (0.11) | restarted from its last checkpoint — or, if the jobmanager exited, once it is started again |
+| job submission (keeper, 0.11) | intent fenced before submitting; an unresolved attempt kept until its job is found and stopped; a superseded generation cancelled by whichever keeper sees it |
+| window result → Redis (`windows_writer`, 0.11) | at-least-once in; a repeat within a generation converges; a window never moves back to an older generation than one it has accepted |
+| window hint → page (0.11) | at most once per publication, as at 0.9 |
 
 That last clause matters. `COUNT(*)` is deterministic for the same *accepted*
 events, but idleness is decided on processing time, so an event excluded in the
 first run could be counted in the replay. The repeat above was identical because
-the input was controlled. A downstream writer keyed by page and window — 0.11's —
-makes a *repeated* result harmless, the way 0.4's `SET` and 0.5's upsert do. It
-does not choose between two *different* ones.
+the input was controlled. A downstream writer keyed by page and window makes a
+*repeated* result harmless, the way 0.4's `SET` and 0.5's upsert do. On its own
+it does not choose between two *different* ones; 0.11's generations decide
+between two jobs' results, and within one job the later write stands.
 
 Exactly-once output exists — Kafka transactions committed on checkpoint, with
 results visible only once a checkpoint completes and consumers reading
-`read_committed` — and this release does not need it. Its only reader is a person
-at a terminal.
+`read_committed` — and this release does without it. At 0.10 the only reader
+was a person at a terminal; since 0.11 it is the windows writer, which makes a
+repeated result converge and lets a newer generation's results replace an older
+one's, per window. Within one job, if a restore's replay counts a window
+differently, the later write stands.
 
-**What recovery does not cover:** a taskmanager failure restarts the job from its
-checkpoint, but a *jobmanager* restart, in this session cluster without high
-availability, loses the job. Measured by accident: recreating the Flink
+**What recovery did not cover at 0.10:** a taskmanager failure restarted the job
+from its checkpoint, but a *jobmanager* restart, in a session cluster without
+high availability, lost the job. Measured by accident: recreating the Flink
 containers after an image rebuild left the cluster knowing nothing of the job.
-Nor were its checkpoints left behind to restore from: by default Flink deletes
-a job's checkpoints when it stops, and what remained on the volume was empty
-directories. Nothing resubmits the job — that is 0.11's submitter, which will
-have to retain checkpoints deliberately before it can restore from one.
+Nor were its checkpoints left behind to restore from: Flink deletes a job's
+checkpoints when it stops. 0.11 closes that gap with Flink's own high
+availability, rather than a resubmitter of ours that retains checkpoints — next.
+
+## Keeping the job: actual state and desired state
+
+A job that must keep running has two kinds of state, and they need different
+owners.
+
+Its **actual** state — the job, its windows, its offsets — is Flink's to recover,
+and in high-availability mode Flink can. Measured, with a window half-counted
+(12 events, checkpointed) when the jobmanager went:
+
+| jobmanager | back `RUNNING` | job id | restored from | the window, once closed |
+|---|---|---|---|---|
+| restarted | 6.8s | the same | checkpoint 3 | exactly 12 |
+| container replaced | 4.0s | the same | checkpoint 6 | exactly 12 |
+
+Exactly 12: not short, which would mean state lost, and not doubled, which would
+mean offsets rewound without the state that had counted them. A resubmitter of
+our own that retained checkpoints could lose nothing either, while Kafka keeps
+the input — but it would re-implement high availability, and replay from the last
+checkpoint it had *recorded* rather than the last one completed.
+
+Its **desired** state — that the job should exist at all — is ours, and belongs
+to the leader 0.7 already elects. The leading coordinator runs a **keeper**: on a
+thread of its own, so Flink's latency never reaches the snapshots, it compares a
+record in ZooKeeper with what Flink reports, and acts.
+
+```bash
+uv run flink-job status
+```
+
+```text
+record (version 2): generation 1, written under epoch 8, 0 consecutive resubmission(s)
+  g1 pageview-windows-g1 (current): e4a1519cc49983c3bb999564f0f594d9
+      RUNNING, 2 checkpoint(s) completed
+```
+
+That makes 0.7's caveat concrete. Fencing protects ZooKeeper writes, but
+submitting and cancelling a job are side effects *outside* ZooKeeper, which a
+deposed leader can still perform. Three rules cover them:
+
+- **A fenced intent before every submission.** The record is rewritten —
+  generation *n + 1*, no job id yet — fenced on the epoch *and* on the record's
+  own version, before `pageview-windows-g<n+1>` is submitted. A deposed leader's
+  write is rejected, so it never submits; so is a decision made on a stale read.
+- **Generations only increase**, so "superseded" is permanent, and a job older
+  than the generation a keeper read can be cancelled by *any* keeper, current or
+  not. A newer one is never cancelled: it means the read was stale. The
+  alternative — cancel anything that is not the recorded job — lets a paused
+  leader resume and cancel its successor's job.
+- **Every attempt is kept until it is accounted for.** An attempt starts with no
+  id — unresolved until proven otherwise — and leaves the record only when its
+  job is confirmed stopped or not found. A submission whose outcome is unknown
+  is superseded after a window, but stays owed: it may still land, and is
+  cancelled the moment any keeper sees it. Finding generation 2 accounts for
+  generation 2 only. The one shortcut is knowledge the keeper has of itself: a
+  tenure that wrote an intent — or may have, its write left unconfirmed — and
+  never called Flink for it knows that generation cannot exist, and supersedes
+  it at once. A submission that did run stays uncertain however it ended.
+
+Two lessons from 0.10 apply directly. **Unknown is never absent**: a listing or
+a lookup that fails decides nothing, however long it goes on. And **a listing is
+for discovery** — a decision about one job asks about that job. In Flink 2.2.1 a
+*successful* `/jobs/overview` can omit a live job: the dispatcher asks each job's
+runner for its details and drops any query that fails. So the keeper looks a
+recorded job up by id, at `/jobs/:id`, whose 404 means no runner and no archived
+copy. Not at `/jobs/:id/status`, which reports a job it does not know as a 500 —
+the same answer as a server error (measured).
+
+Recovery is not absence either. `SUSPENDED`, `RESTARTING`, `INITIALIZING` and
+`CREATED` mean the job exists and is coming back, so the keeper waits; only a
+terminal state or a 404 supersedes it. Measured across a restart, polling every
+100ms: refused connections for about 3.5s, then `503 … ongoing leader election`,
+then a first successful listing that already held the job.
+
+What the fences cannot stop is a keeper that wrote its intent and lost
+leadership while its submission was in flight. Its successor waits out the
+uncertainty window — the submission's 120s bound plus 0.10's twenty seconds —
+and may submit the next generation; the first, landing late, runs until a keeper
+cancels it. So duplicate *execution* is possible, rare and short-lived — and its
+results are already in Kafka when it is cancelled. That is the windows writer's
+problem, below.
+
+Repeated failures back off: the first resubmission is immediate, then 10s,
+doubling to five minutes, and the count resets once a generation has run for a
+minute. Submissions are rare in any case — measured at 4.3s, against the 120s
+bound.
+
+## The job outlives the leader
+
+The job is the pipeline's, not the leader's, so stepping down leaves it running:
+
+- `honcho start` submits generation 1, or adopts whatever the record names;
+- Ctrl-C stops every process and leaves the job running in Compose;
+- the next `honcho start` adopts it and submits nothing — the record's version
+  does not even change.
+
+Cancelling is now a demonstration. Measured: within ten seconds of `g1` being
+cancelled — the keeper's five-second cycle, then a four-second submission —
+`g2` was running; it replayed the topic from the start, and every window in
+Redis was rewritten under generation 2.
+
+```bash
+uv run flink-job cancel <id>      # then watch the page's Windows table
+```
+
+**A behaviour change for readers:** with high availability the job survives
+`docker compose down` and comes back on the next `up`, because the volumes keep
+everything it needs — measured with ZooKeeper's and Flink's containers removed
+and recreated: the same job, tasks running, 12s after `up`. `docker compose down
+--volumes` removes it with everything else.
+
+**Upgrading from 0.10:** run `uv run cluster init` again, which adds the
+keeper's record to the existing tree, and recreate the Flink containers with
+the new image: `docker compose up -d --wait --build`.
+
+## High availability, and what lives where
+
+High availability is configuration, on both Flink containers:
+
+```yaml
+high-availability.type: zookeeper
+high-availability.zookeeper.quorum: zookeeper:2181
+high-availability.zookeeper.path.root: /flink
+high-availability.cluster-id: /session
+high-availability.storageDir: file:///opt/flink/ha
+```
+
+ZooKeeper gains a second customer — in the series where Kafka left it at 0.2.
+One server, two trees, neither writing the other's:
+
+```bash
+docker compose exec zookeeper zkCli.sh ls /         # [flink, pipeline, zookeeper]
+docker compose exec zookeeper zkCli.sh ls -R /flink
+```
+
+**ZooKeeper does not hold the job.** It holds coordination — leader nodes, a
+checkpoint counter, and small pointers: a job's execution-plan node is 508
+bytes. The payloads are elsewhere, measured for one running job:
+
+| store | holds | volume |
+|---|---|---|
+| ZooKeeper | leadership, counters, pointers | `zookeeper-data`, `zookeeper-datalog` |
+| HA storage | the submitted execution plan (170 KB), completed-checkpoint metadata (31 KB), the job's artifacts (42 MB, PyFlink's) | `flink-ha` |
+| checkpoint storage | the state itself | `flink-checkpoints` |
+
+All three are kept or removed together: pointers into storage that has gone are
+worth nothing. A job that ends is cleaned out of HA storage by Flink.
+
+**With one jobmanager this is durability, not availability.** Nothing stands by;
+the job is down for the four to seven seconds a restart takes. And a job whose
+state is `RUNNING` is not necessarily making progress: measured after an
+outage, the job reported `RUNNING` with every task still `CREATED`, waiting for a
+taskmanager that had not come back.
+
+The checkpoint volume also collects an empty `<job id>/{shared,taskowned}`
+directory for every job ever run, cancelled smoke-test jobs included. They are
+empty, and harmless; `docker compose down --volumes` clears them.
+
+## When ZooKeeper goes away
+
+The price of high availability is that the running job now depends on
+ZooKeeper. Measured:
+
+- **Paused for 10s**: nothing happened.
+- **Paused for 50s**: the job restarted from its last checkpoint. Flink's session
+  is negotiated at 40 seconds — our server's default cap, twenty ticks of two
+  seconds, read from the jobmanager's log — so 50s is past expiry.
+- **Stopped**: Flink's REST API went at once. At about 31 seconds the jobmanager's
+  ZooKeeper client gave up retrying, and the process **exited** (`Fatal error
+  occurred in the cluster entrypoint`, exit code 239); the taskmanager exited at
+  about a minute (exit code 1). Without a restart policy, when ZooKeeper came
+  back, neither did — and started by hand, the jobmanager had the same job back
+  within six seconds, its tasks running once the taskmanager was started too.
+
+High availability restores a job *when a jobmanager returns*; it does not bring
+the jobmanager back. So both Flink containers have `restart: on-failure`:
+Docker brings the processes back, Flink restores execution, and the keeper
+reconciles intent. Measured through a two-minute outage, the jobmanager
+restarted about every seventy seconds while ZooKeeper was away, and 46 seconds
+after it returned the same job's tasks were running again, untouched. In
+production that job is Kubernetes'.
+
+The policy has edges worth knowing. It restarts a process that **exits
+non-zero** — not a container that is merely *unhealthy*, which Docker does not
+act on, and not one stopped deliberately: `docker compose stop` stays stopped.
+
+Our coordinators lose their sessions in the same outage — one dependency, two
+customers — and the keeper, finding Flink unavailable, reports it and backs off
+rather than deciding anything.
+
+`high-availability.zookeeper.client.tolerate-suspended-connections` stays off.
+Under the 50-second pause it did not prevent the restart, only changed its
+shape — but that pause was past expiry, and the option is for connections
+suspended *short* of it, which this release has not measured.
+
+## Windows in Redis, and which result a window keeps
+
+The `windows_writer` process reads `pageview_windows` with a consumer group of
+its own and writes each result to Redis, one Lua script per result, atomic in
+Redis:
+
+```text
+windows                     a sorted set of window starts — the index
+windows:<start>             page -> views
+windows:<start>:meta        generation, end
+```
+
+Every result carries the **generation** of the job that produced it — a literal
+column in the job's SQL, part of the job graph, so high availability restores it
+with the job. Two jobs can count the same window differently: each rebuilds its
+watermark from scratch, so late-drop decisions depend on arrival order, and the
+future-skew rule reads processing time. If the intended job writes 12 and a
+superseded one, landing late, then writes 9, last-write-wins would leave 9 on the
+page until the window expired — and a stray replays the whole topic, so it could
+rewrite every retained window, not one.
+
+So the script compares generations. Older than the generation the window has
+accepted: refused. Newer: the window is replaced whole, so no page from an older
+generation lingers. The same: the page is updated, which is how an HA restore's
+repeats converge. The contract, exactly:
+
+> **For each retained window, results cannot move back from a generation Redis
+> has already accepted.**
+
+It is narrower than "every superseded generation refused". An older generation
+can still write a window its successor has not written yet, and that result
+stands if the successor never emits the window. And a Redis restart forgets the
+generations along with the views, until the rebuild replays them. Refusing
+against the *current* generation would mean the writer reading the keeper's
+record — another coordination contract, deliberately not added. This is the
+fencing token carried to where the effect lands, scoped to what one store can
+see.
+
+Expiry is set from **event time**, the window's end plus an hour — not from the
+moment of writing — so a replay that rewrites a two-hour-old window finds it
+expired, and the script skips it rather than resurrect it as recent. Offsets are
+committed only after a batch's scripts have all run; a batch that fails is
+rewound and written again.
+
+Then a **hint**, best-effort as at 0.9, on `events:windows`: once per window
+written, with its bounds and no counts — announce, and let the reader fetch.
+The API's one subscription now has two channels, and recovery means both are
+acknowledged, matched by name within each attempt: the count in Redis's
+acknowledgement is the connection's active subscriptions, not acknowledgements
+received — subscribing to one channel twice answers 1 both times (measured).
+
+```bash
+curl -s 'localhost:8000/windows?limit=2'
+```
+
+```json
+{
+  "windows": [
+    {"start": "2026-10-11T21:02:50Z", "end": "2026-10-11T21:03:00Z", "generation": 1,
+     "counts": {"/checkout": 3, "/": 2, "/pricing": 1, "/docs": 4}},
+    {"start": "2026-10-11T21:02:40Z", "end": "2026-10-11T21:02:50Z", "generation": 1,
+     "counts": {"/checkout": 4, "/docs": 2, "/pricing": 2, "/": 1}}
+  ],
+  "retention_seconds": 3600,
+  "observed_at": "2026-10-11T21:03:10.633327Z"
+}
+```
+
+`/windows` applies the expiry at read time too: the index is trimmed only when
+something is written, so with traffic stopped it outlives the windows it lists.
+Each window's counts and generation come from one `MULTI`/`EXEC`, so a response
+cannot label old counts with a newly advanced generation, and a window that
+expires between the index and the fetch is left out — a response can hold fewer
+windows than asked for, never an empty one. The live page's **Windows** table
+reads it after a hint, after any reconnection, and every 30 seconds; a window
+fills in as its pages land, because Flink sends no end-of-window marker.
 
 ## Pinned hard
 
@@ -1475,7 +1766,7 @@ Three services, three answers to "what survives being replaced":
 | Cassandra | a durable, query-oriented materialized view | yes |
 | RabbitMQ | durable work awaiting completion | yes, but only while unacknowledged |
 | ZooKeeper | coordination state | persistent znodes survive; **ephemeral ones die with their session**, which is the point of them |
-| Flink | a stateful job's checkpoints | a volume, shared by both Flink containers, so a running job survives a taskmanager failure. Not beyond the job: Flink deletes checkpoints when a job stops, and the job itself does not survive a jobmanager restart without high availability |
+| Flink | a stateful job's checkpoints, and its high-availability storage | two volumes, with ZooKeeper's pointers into them: a running job survives a taskmanager failure, a jobmanager restart and `down`/`up`. Not beyond the job: Flink deletes a job's checkpoints when it stops |
 
 Cassandra is still *derived* from the Kafka log — everything in it can be
 rebuilt by the same replay that rebuilds Redis. Its volume changes how durable
@@ -1538,6 +1829,12 @@ uv run counters
 
 Twenty again, not twenty-three: the same replay mechanism that corrupted the
 counter repairs it, because this time nothing crashed partway.
+
+The windows rebuild the same way, from their own log. Reset the writer's group
+— `--group windows-writer --topic pageview_windows`, with the writer stopped —
+and start it again: windows still within their retention come back, each at the
+newest generation it saw. Measured, a fresh group under a throwaway prefix
+rebuilt the same five windows Redis held, identically.
 
 Two conditions, both load-bearing. Stopping the producer gives the replay a
 fixed endpoint, so the result is a number you can check rather than a moving
@@ -1620,7 +1917,8 @@ separate nodes.
 ZooKeeper appears in this tutorial at 0.7 — coordinating the pipeline's own
 processes, which is a different job from storing Kafka's metadata. That
 separation is the point: a reader meets ZooKeeper as a coordination primitive
-they chose, not as infrastructure another service dragged in.
+they chose, not as infrastructure another service dragged in. At 0.11 Flink
+becomes its second customer, for high availability, in a tree of its own.
 
 ## Testing
 
@@ -1650,11 +1948,22 @@ docker compose down
 PASS  host listener: produced and consumed via localhost:9092
 PASS  internal listener: kafka:29092 and localhost:9092 are the same broker
 PASS  partition routing: all 4 partitions addressed by the routing rule
-PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 128 to 230; 4 counters, 237 last-page values; rows written to smoke_7656670c; 4 workers, 238 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; API on port 57817 read back the Redis, Cassandra and ZooKeeper sentinels and states its 404 and 422 contracts; leader …-30351 wrote again at epoch 1 (snapshot v26 -> v27); all 4 workers applied worker_delay=0.03 at config version 1; a known event reached a subscribed socket (partition 1, offset 82); foreign and missing origins refused; nothing was left running
-PASS  flink windows: job 5d6d7cb7 counted {'/docs': 12, '/pricing': 8} in window 2026-10-09T15:34:50Z on its own topics; 1 checkpoint(s) completed; cancelled
+PASS  window writes: older generation refused, same updated, newer replaced the window whole, an expired window skipped and trimmed — in Redis itself
+PASS  honcho topology: 4 consumers own 4 partitions; committed offsets advanced 141 to 246; 4 counters, 252 last-page values; rows written to smoke_b1dedf9e; 4 workers, 253 jobs completed; one leader at epoch 1 among 3 contenders; 4 consumers and 4 workers registered; the leader keeps smoke-topology-b1dedf9e-g1 running as 0d0f6c3a; 2 window(s) written under smoke:b1dedf9e:; API on port 49371 read back the Redis, Cassandra and ZooKeeper sentinels and states its 404 and 422 contracts; leader …-71814 wrote again at epoch 1 (snapshot v27 -> v28); all 4 workers applied worker_delay=0.03 at config version 1; a known event reached a subscribed socket (partition 1, offset 93); foreign and missing origins refused; window 2026-10-11T21:01:10Z hinted on the socket and served over HTTP as the job wrote it: {'/docs': 59, '/': 48, '/pricing': 34, '/checkout': 40}; jobmanager restarted: job 0d0f6c3a back, restored from checkpoint 9, record unchanged at version 2, and a window of post-recovery input served (2026-10-11T21:01:30Z); nothing was left running
+PASS  flink windows: job 6a1424ae counted {'/docs': 12, '/pricing': 8} in window 2026-10-11T20:51:50Z on its own topics; 2 checkpoint(s) completed; cancelled
 
-all 5 checks passed in 26.8s
+all 6 checks passed in 62.7s
 ```
+
+That run had the jobmanager restart switched on, as CI does —
+`SMOKE_RESTART_JOBMANAGER=1 uv run smoke-test`. It is off by default locally,
+because the jobmanager is shared with your own job, which would restart with it.
+
+`window writes` runs the windows writer's Lua script against Redis itself, under
+a prefix of its own: the rules a fake could only restate — an older generation
+refused, the same one updating a page, a newer one replacing the window whole,
+an expired window skipped rather than resurrected, the index trimmed — and the
+API's read taking each window's counts and generation together.
 
 The Flink check is isolated the same way: topics, consumer group and job of its
 own, cancelled afterwards by the job id it captured — never by a name a reader's
@@ -1711,6 +2020,11 @@ hold, under one shared deadline:
   ZooKeeper reported, a 404 for an unknown user, a 422 for `limit=101`, and an
   OpenAPI document listing every route.
 
+Since 0.11, readiness also requires the leader's record to name a running job
+of the record's own generation, and a window written under the run's prefix. The
+run's keeper submits `smoke-topology-<run>-g<n>`, reading and writing topics of
+the run's own, with the writer in a consumer group of its own.
+
 After readiness, **one known event, end to end**: the check opens a WebSocket,
 waits until the API says it is *subscribed* — `ready` with `bridge:
 "subscribed"`, or a `resubscribed` after a `ready` that said otherwise — then
@@ -1723,6 +2037,35 @@ would rightly drop a notification published before the socket was enrolled. It
 also requires a foreign and a missing `Origin` to be refused, and `/live` and its
 module to be served. The run's channel carries the run's key prefix, because
 pub/sub channels ignore the Redis database.
+
+Then **one window, end to end**: on a subscribed socket, the next window hint
+names a window, and `GET /windows` must serve that window with exactly the pages
+and counts of the newest generation's latest results for it in the run's windows
+topic — both read afresh until they match or the deadline passes, since a
+window's pages can land in different batches. The expected counts are the job's
+own output, not an injected fixture: nothing but a working writer and API can
+produce them, and the known event above — page `/docs`, a producer page —
+cannot contaminate them. Whether Flink counts correctly is `flink windows`'s
+job, on known input.
+
+With the restart switched on, **the jobmanager restarted with the keeper
+running**: only after the job's first completed checkpoint, so the restore is
+exercised rather than a start from nothing; then the same job id back
+`RUNNING`, restored from a checkpoint, the record's ZooKeeper version unchanged —
+which proves no new intent was recorded, not that no earlier, authorised
+submission could still land — and **progress**: a window that *starts* after the
+job was running again, so every event in it was produced after the recovery. A
+hint alone would not do, and nor would `RUNNING`: measured, a job can report
+`RUNNING` with every task still waiting for slots.
+
+Teardown, after the processes have stopped, is driven by the run's record:
+every attempt with an id is stopped and confirmed by direct lookup; every
+attempt without one is reconciled by its own generation's name for twenty
+seconds, and if any is still unaccounted for the topics are kept and the check
+fails, naming that generation. Finding generation 2 never accounts for
+generation 1. A prefix listing cross-checks for jobs no record names. High
+availability raises the stakes: a job left behind would come back after every
+jobmanager restart.
 
 The API check uses sentinels rather than whatever the producer happened to
 write, because it tests the read path only — the other predicates already prove
@@ -1773,19 +2116,21 @@ src/pipeline/
     failover_demo.py     the two-leaders demonstration
     flink_job.py         the Flink job: event-time windows, as Flink SQL
     flink_cluster.py     submitting to Flink and reading its REST API
-    flink_jobs.py        flink-job: submit, status, cancel by id
-    windows.py           prints the latest windowed counts
+    job_keeper.py        the leader's keeper: fenced intent, generations, attempts
+    flink_jobs.py        flink-job: the keeper's record, status, cancel by id
+    windows.py           prints the latest windowed counts, straight from Kafka
+    windows_writer.py    the job's windows into Redis, by generation
     api.py               the HTTP API: one endpoint per store, bounded reads
     bulkhead.py          per-store admission, worker allowance and deadline
     notifications.py     what the consumer announces, and the best-effort publish
     bridge.py            the API's one Redis subscription, heartbeat and recovery
     fanout.py            bounded per-socket queues, eviction and admission
     static/live.html     the live page
-    static/live.mjs      its offset tracker and read scheduler
+    static/live.mjs      its offset tracker, read scheduler and window rows
     topology_runner.py   starts, observes and stops the whole topology
     smoke_test.py        bounded assertions against a running broker
 tests/
-tests/js/                the tracker's and scheduler's own tests, for node --test
+tests/js/                the page module's own tests, for node --test
 Procfile                 the processes that make up the running system
 ```
 

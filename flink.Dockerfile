@@ -46,9 +46,10 @@ RUN apt-get update \
 RUN curl -fsSL -o /opt/flink/lib/flink-sql-connector-kafka.jar "$CONNECTOR_URL" \
     && echo "$CONNECTOR_SHA256  /opt/flink/lib/flink-sql-connector-kafka.jar" | sha256sum -c -
 
-# Created here, owned by flink, so the named volume mounted over it starts out
+# Created here, owned by flink, so the named volumes mounted over them start out
 # writable by the user Flink runs as.
-RUN mkdir -p /opt/flink/checkpoints && chown flink:flink /opt/flink/checkpoints
+RUN mkdir -p /opt/flink/checkpoints /opt/flink/ha \
+    && chown flink:flink /opt/flink/checkpoints /opt/flink/ha
 
 # The job is part of the image: what the smoke test runs is what ships.
 COPY --chown=flink:flink src/pipeline/flink_job.py /opt/pipeline/flink_job.py

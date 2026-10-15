@@ -11,7 +11,10 @@ import time
 import pytest
 import redis
 
+from pipeline import notifications
 from pipeline.bridge import INTERRUPTED, SUBSCRIBED, Bridge
+
+PAGEVIEWS, WINDOWS = "p:events:pageviews", "p:events:windows"
 
 
 @pytest.fixture
@@ -20,18 +23,30 @@ def anyio_backend():
 
 
 class FakeSubscription:
-    def __init__(self, *, ack=True, answer_pings=True):
+    """`acks`: which channels (by index) are acknowledged, in order. Redis's
+    count is the connection's active subscriptions, so a repeat does not raise
+    it — as measured."""
+
+    def __init__(self, *, ack=True, answer_pings=True, acks=None):
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.ack = ack
+        self.acks = acks
         self.answer_pings = answer_pings
         self.pings: list[str] = []
+        self.channels: tuple[str, ...] = ()
         self.channel = None
         self.closed = False
 
-    async def subscribe(self, channel):
-        self.channel = channel
-        if self.ack:
-            self.inbox.put_nowait({"type": "subscribe", "channel": channel, "data": 1})
+    async def subscribe(self, *channels):
+        self.channels, self.channel = channels, channels[0]
+        if not self.ack:
+            return
+        active: set[str] = set()
+        for index in self.acks if self.acks is not None else range(len(channels)):
+            active.add(channels[index])
+            self.inbox.put_nowait(
+                {"type": "subscribe", "channel": channels[index], "data": len(active)}
+            )
 
     async def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
         try:
@@ -53,8 +68,10 @@ class FakeSubscription:
     async def aclose(self):
         self.closed = True
 
-    def publish(self, raw):
-        self.inbox.put_nowait({"type": "message", "channel": self.channel, "data": raw})
+    def publish(self, raw, channel=None):
+        self.inbox.put_nowait(
+            {"type": "message", "channel": channel or self.channel, "data": raw}
+        )
 
     def fail(self, error):
         self.inbox.put_nowait(error)
@@ -88,7 +105,10 @@ class Harness:
         )
         self.bridge = Bridge(
             self._open,
-            "p:events:pageviews",
+            {
+                PAGEVIEWS: notifications.parse,
+                WINDOWS: notifications.parse_window,
+            },
             lambda text: self.relayed.append(json.loads(text)),
             self.notices.append,
             **(defaults | options),
@@ -334,10 +354,8 @@ def test_the_subscription_client_uses_the_async_retry_with_no_recovery():
 @pytest.mark.anyio
 async def test_a_non_finite_number_is_dropped_not_relayed(running, monkeypatch):
     """The backstop: even if parse() let one through, the browser never sees it."""
-    from pipeline import bridge as bridge_module
-
     monkeypatch.setattr(
-        bridge_module.notifications,
+        notifications,
         "parse",
         lambda raw: {"type": "pageview", "timestamp": float("nan")},
     )
@@ -377,3 +395,68 @@ async def test_rejected_numbers_are_dropped_and_the_subscription_kept(running):
     assert harness.bridge.state == SUBSCRIBED
     assert harness.kinds() == ["resubscribed"], "no interruption"
     assert len(harness.opened) == 1, "no reconnect"
+
+
+# --- two channels, acknowledged by name -----------------------------------------
+
+
+@pytest.mark.anyio
+async def test_recovery_needs_every_channel_acknowledged(running):
+    harness = running(Harness(FakeSubscription()))
+
+    await until(lambda: harness.bridge.state == SUBSCRIBED)
+
+    assert harness.opened[0].channels == (PAGEVIEWS, WINDOWS)
+    assert harness.kinds() == ["resubscribed"]
+
+
+@pytest.mark.anyio
+async def test_a_repeated_first_acknowledgement_does_not_stand_in_for_the_second(
+    running,
+):
+    """Count 1 again, as Redis answers a repeat — never mistaken for channel two."""
+    harness = running(Harness(FakeSubscription(acks=[0, 0]), FakeSubscription()))
+
+    await until(lambda: len(harness.opened) == 2)  # the first attempt timed out
+    await until(lambda: harness.bridge.state == SUBSCRIBED)
+
+    assert harness.kinds() == ["resubscribed"]
+
+
+@pytest.mark.anyio
+async def test_a_missing_second_acknowledgement_never_recovers(running):
+    harness = running(Harness(*[FakeSubscription(acks=[0]) for _ in range(5)]))
+
+    await until(lambda: len(harness.opened) >= 3)
+
+    assert harness.bridge.state == INTERRUPTED
+    assert harness.kinds() == []
+
+
+@pytest.mark.anyio
+async def test_the_second_channels_expected_acknowledgement_is_not_a_resubscription(
+    running,
+):
+    harness = running(Harness(FakeSubscription(acks=[1, 0])))
+    await until(lambda: harness.bridge.state == SUBSCRIBED)
+    await asyncio.sleep(0.1)
+
+    assert harness.kinds() == ["resubscribed"]  # the recovery, and nothing more
+
+
+@pytest.mark.anyio
+async def test_each_channel_is_parsed_by_its_own_rules(running):
+    first = FakeSubscription()
+    harness = running(Harness(first))
+    await until(lambda: harness.bridge.state == SUBSCRIBED)
+
+    first.publish(notifications.encode_window(1791000000, 1791000010), WINDOWS)
+    first.publish(valid(), WINDOWS)  # a page view where a window hint belongs
+    first.publish(notifications.encode_window(1791000000, 1791000010), PAGEVIEWS)
+    first.publish(valid(), PAGEVIEWS)
+    first.publish(valid(), "p:events:elsewhere")
+    await until(lambda: len(harness.relayed) == 2)
+    await asyncio.sleep(0.05)
+
+    assert [m["type"] for m in harness.relayed] == ["window", "pageview"]
+    assert harness.bridge.dropped == 3

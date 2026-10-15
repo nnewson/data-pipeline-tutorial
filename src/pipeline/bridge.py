@@ -8,6 +8,13 @@ slow down and Redis buffers on its side, until its own output-buffer limit for
 pub/sub clients evicts this subscriber. That is the backpressure, and it shows
 up as an interruption rather than as memory.
 
+Since 0.11 the one subscription has two channels — page views, and the windows
+writer's hints — and recovery means *both* are acknowledged, matched by channel
+name within each attempt. Not by the count an acknowledgement carries: that is
+the connection's number of active subscriptions, not of acknowledgements
+received (subscribing to one channel twice answers 1 both times, measured), so
+it describes the connection rather than this attempt.
+
 What the bridge can prove is narrow: *when it knew it was not listening*. Not
 what was published meanwhile — only the offsets in later notifications can hint
 at that, and only to a subscriber that saw both sides of the gap.
@@ -30,15 +37,13 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import redis.asyncio
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
-
-from pipeline import notifications
 
 logger = logging.getLogger("bridge")
 
@@ -93,15 +98,16 @@ def now_iso() -> str:
 class Bridge:
     """Subscribe, relay, notice failure, back off, subscribe again — for ever.
 
-    `relay` receives each valid notification as JSON text; `notice` receives the
-    bridge's own state changes. Both are called on the event loop and must not
-    block: they are the fan-out's non-blocking puts.
+    `channels` maps each channel to the parser that decides what may be relayed
+    from it. `relay` receives each valid notification as JSON text; `notice`
+    receives the bridge's own state changes. Both are called on the event loop
+    and must not block: they are the fan-out's non-blocking puts.
     """
 
     def __init__(
         self,
         open_subscription: Callable[[], Subscription],
-        channel: str,
+        channels: Mapping[str, Callable[[Any], dict | None]],
         relay: Callable[[str], None],
         notice: Callable[[dict], None],
         *,
@@ -113,7 +119,7 @@ class Bridge:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._open = open_subscription
-        self._channel = channel
+        self._channels = dict(channels)
         self._relay = relay
         self._notice = notice
         self._interval = heartbeat_interval
@@ -138,7 +144,7 @@ class Bridge:
                 # let a slow-but-alive Redis spend several of them.
                 async with asyncio.timeout(self._attempt_deadline):
                     subscription = self._open()
-                    await subscription.subscribe(self._channel)
+                    await subscription.subscribe(*self._channels)
                     await self._acknowledged(subscription)
                 self._subscribed(detected_at)
                 backoff = self._backoff_initial
@@ -160,11 +166,17 @@ class Bridge:
             backoff = min(self._backoff_max, backoff * 2)
 
     async def _acknowledged(self, subscription: Subscription) -> None:
-        """Wait for the subscribe confirmation: recovered means confirmed."""
-        while True:
+        """Wait for every channel's confirmation: recovered means confirmed.
+
+        By name, within this attempt: a repeated acknowledgement for one channel
+        does not stand in for another's, and nothing short of all of them
+        counts. The attempt's deadline bounds the wait.
+        """
+        waiting = set(self._channels)
+        while waiting:
             message = await subscription.get_message(timeout=0.1)
             if message and message.get("type") == "subscribe":
-                return
+                waiting.discard(message.get("channel"))
 
     async def _pump(self, subscription: Subscription) -> None:
         """Relay until something fails. Never returns normally."""
@@ -192,7 +204,7 @@ class Bridge:
                 outstanding = None
                 next_ping = self._clock() + self._interval
             elif kind == "message":
-                self._forward(message.get("data"))
+                self._forward(message.get("channel"), message.get("data"))
             elif kind == "subscribe":
                 # redis-py reconnected and resubscribed underneath us. We did not
                 # see the connection go, so all we can say is when we found out.
@@ -215,8 +227,9 @@ class Bridge:
             # Yield, so a flood of buffered messages cannot starve other tasks.
             await asyncio.sleep(0)
 
-    def _forward(self, raw: Any) -> None:
-        notification = notifications.parse(raw)
+    def _forward(self, channel: Any, raw: Any) -> None:
+        parse = self._channels.get(channel)
+        notification = parse(raw) if parse is not None else None
         try:
             # allow_nan=False as a backstop to parse(): never send a browser
             # something its JSON.parse will throw on.
@@ -235,7 +248,7 @@ class Bridge:
     def _subscribed(self, detected_at: str) -> None:
         self.state = SUBSCRIBED
         resubscribed_at = now_iso()
-        logger.info(f"subscribed to {self._channel}")
+        logger.info(f"subscribed to {', '.join(self._channels)}")
         self._notice(
             {
                 "type": "resubscribed",

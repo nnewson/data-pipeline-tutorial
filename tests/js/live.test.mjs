@@ -5,7 +5,11 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { createScheduler, createTracker } from "../../src/pipeline/static/live.mjs";
+import {
+  createScheduler,
+  createTracker,
+  windowRows,
+} from "../../src/pipeline/static/live.mjs";
 
 // --- The tracker ----------------------------------------------------------
 
@@ -295,5 +299,45 @@ describe("scheduler", () => {
     instance.request();
     await time.advance(120000);
     assert.equal(reads, 1);
+  });
+});
+
+// --- The windows table ------------------------------------------------------
+
+describe("windowRows", () => {
+  const windows = [
+    {
+      start: "2026-10-12T10:00:00Z",
+      end: "2026-10-12T10:00:10Z",
+      generation: 2,
+      counts: { "/pricing": 1, "/docs": 3 },
+    },
+    {
+      start: "2026-10-12T10:00:10Z",
+      end: "2026-10-12T10:00:20Z",
+      generation: 3,
+      counts: { "/docs": 5 },
+    },
+  ];
+
+  test("newest window first, whatever order they arrive in", () => {
+    assert.deepEqual(
+      windowRows(windows).map((row) => row.start),
+      ["2026-10-12T10:00:10Z", "2026-10-12T10:00:00Z"],
+    );
+  });
+
+  test("pages in a stable order, totalled over what has arrived", () => {
+    const [, older] = windowRows(windows);
+    assert.deepEqual(older.pages, [["/docs", 3], ["/pricing", 1]]);
+    assert.equal(older.total, 4);
+  });
+
+  test("each window keeps its own generation", () => {
+    assert.deepEqual(windowRows(windows).map((row) => row.generation), [3, 2]);
+  });
+
+  test("no windows is no rows, not an error", () => {
+    assert.deepEqual(windowRows([]), []);
   });
 });

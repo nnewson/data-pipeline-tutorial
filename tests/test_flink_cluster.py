@@ -2,7 +2,6 @@
 
 import io
 import json
-import subprocess
 import urllib.error
 
 import pytest
@@ -166,20 +165,20 @@ def test_a_listed_metric_whose_value_vanishes_is_unavailable_not_zero(cluster):
     assert flink_cluster.metric_sum(JOB, "numLateRecordsDropped") is None
 
 
-class Timeout:
-    def __init__(self, stdout):
-        self.stdout = stdout
+def _submitting(monkeypatch, script: str, timeout: float = 5) -> None:
+    """Run `script` in place of the real submission: a real process, briefly."""
+    monkeypatch.setattr(
+        flink_cluster, "submit_command", lambda _s: ["sh", "-c", script]
+    )
+    monkeypatch.setattr(flink_cluster, "SUBMIT_TIMEOUT_SECONDS", timeout)
 
-    def __call__(self, *args, **kwargs):
-        raise subprocess.TimeoutExpired(
-            cmd="flink run", timeout=120, output=self.stdout
-        )
+
+PRINTS_ID = f"printf 'Job has been submitted with JobID {'c' * 32}\\n'"
 
 
 @pytest.mark.allow_connect
 def test_a_timed_out_submission_keeps_a_job_id_it_already_printed(monkeypatch):
-    printed = b"Job has been submitted with JobID " + b"c" * 32 + b"\n"
-    monkeypatch.setattr(flink_cluster.subprocess, "run", Timeout(printed))
+    _submitting(monkeypatch, f"{PRINTS_ID}; exec sleep 30", timeout=0.5)
 
     assert flink_cluster.submit(Settings()) == "c" * 32
 
@@ -187,19 +186,15 @@ def test_a_timed_out_submission_keeps_a_job_id_it_already_printed(monkeypatch):
 @pytest.mark.allow_connect
 def test_a_timed_out_submission_without_an_id_is_uncertain(monkeypatch):
     """A timeout does not mean Flink rejected the job."""
-    monkeypatch.setattr(flink_cluster.subprocess, "run", Timeout(None))
+    _submitting(monkeypatch, "exec sleep 30", timeout=0.5)
 
-    with pytest.raises(flink_cluster.SubmissionUncertain):
+    with pytest.raises(flink_cluster.SubmissionUncertain, match="timed out"):
         flink_cluster.submit(Settings())
 
 
 @pytest.mark.allow_connect
 def test_output_without_an_id_is_uncertain_too(monkeypatch):
-    monkeypatch.setattr(
-        flink_cluster.subprocess,
-        "run",
-        lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout="", stderr="boom"),
-    )
+    _submitting(monkeypatch, "echo boom >&2; exit 1")
 
     with pytest.raises(flink_cluster.SubmissionUncertain):
         flink_cluster.submit(Settings())
@@ -208,15 +203,66 @@ def test_output_without_an_id_is_uncertain_too(monkeypatch):
 @pytest.mark.allow_connect
 def test_undecodable_output_still_yields_the_job_id(monkeypatch):
     """Regression: one stray byte raised after the job had been submitted."""
-    run = subprocess.run
-    printed = f"printf 'Job has been submitted with JobID {'c' * 32} \\377\\n'"
-    monkeypatch.setattr(
-        flink_cluster.subprocess,
-        "run",
-        lambda command, **kwargs: run(["sh", "-c", printed], **kwargs),
+    _submitting(
+        monkeypatch,
+        f"printf 'Job has been submitted with JobID {'c' * 32} \\377\\n'",
     )
 
     assert flink_cluster.submit(Settings()) == "c" * 32
+
+
+@pytest.mark.allow_connect
+def test_a_terminated_client_is_an_uncertain_submission(monkeypatch):
+    """The keeper terminates the client at shutdown: the job may still land."""
+    _submitting(monkeypatch, "exec sleep 30")
+
+    with pytest.raises(flink_cluster.SubmissionUncertain, match="signal"):
+        flink_cluster.submit(Settings(), started=lambda process: process.terminate())
+
+
+@pytest.mark.allow_connect
+def test_a_command_that_never_ran_is_a_plain_error(monkeypatch):
+    """Nothing was submitted, so nothing needs reconciling."""
+    monkeypatch.setattr(
+        flink_cluster, "submit_command", lambda _s: ["/nonexistent/flink-client"]
+    )
+
+    with pytest.raises(flink_cluster.FlinkError) as raised:
+        flink_cluster.submit(Settings())
+    assert not isinstance(raised.value, flink_cluster.SubmissionUncertain)
+
+
+def test_the_generation_reaches_the_job_through_the_environment():
+    command = flink_cluster.submit_command(Settings(generation=7))
+
+    assert "FLINK_GENERATION=7" in command
+
+
+class NotFoundREST:
+    """`/jobs/:id` answers 404 for a job Flink does not know."""
+
+    def __call__(self, request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+
+@pytest.mark.allow_connect
+def test_a_404_is_a_confirmed_absence_not_merely_unavailable(monkeypatch):
+    monkeypatch.setattr(flink_cluster.urllib.request, "urlopen", NotFoundREST())
+
+    with pytest.raises(flink_cluster.NotFound):
+        flink_cluster.job_state(JOB)
+
+
+@pytest.mark.allow_connect
+def test_a_server_error_is_unknown_not_absent(monkeypatch):
+    def server_error(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 500, "Internal", {}, None)
+
+    monkeypatch.setattr(flink_cluster.urllib.request, "urlopen", server_error)
+
+    with pytest.raises(flink_cluster.FlinkError) as raised:
+        flink_cluster.job_state(JOB)
+    assert not isinstance(raised.value, flink_cluster.NotFound)
 
 
 @pytest.mark.allow_connect

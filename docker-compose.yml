@@ -2,19 +2,37 @@
 # coordinators and the API — run on the host under Honcho, against it.
 #
 # Flink is infrastructure too: a job is submitted to it, not run under Honcho.
-# Both Flink services share one image, built from flink.Dockerfile.
+# Both Flink services share one image, built from flink.Dockerfile. Since 0.11
+# they run in ZooKeeper high-availability mode: a jobmanager that comes back
+# brings its jobs back from their last checkpoints. Docker brings the processes
+# back; Flink restores execution; the elected keeper reconciles intent.
 
 x-flink: &flink
   build:
     context: .
     dockerfile: flink.Dockerfile
-  image: data-pipeline-tutorial-flink:0.10
+  image: data-pipeline-tutorial-flink:0.11
+  # Measured: with ZooKeeper stopped, the jobmanager exits after about 31s and
+  # the taskmanager after about a minute, and neither returns by itself when
+  # ZooKeeper does. on-failure restarts a process that exited non-zero — not a
+  # container that is merely unhealthy, and not one stopped deliberately with
+  # `docker compose stop`.
+  restart: on-failure
   volumes:
     # Shared by jobmanager and taskmanager: filesystem checkpoint storage has to
     # be reachable by both.
     - flink-checkpoints:/opt/flink/checkpoints
+    # High availability's storage: the submitted job graphs, completed
+    # checkpoints' metadata and the job's artifacts. ZooKeeper holds only
+    # pointers into here, and the state itself is in flink-checkpoints, so the
+    # three are kept — or removed — together.
+    - flink-ha:/opt/flink/ha
   depends_on:
     kafka:
+      condition: service_healthy
+    # A new edge at 0.11: with HA, Flink's leadership and its pointers to the
+    # job live in ZooKeeper.
+    zookeeper:
       condition: service_healthy
 
 services:
@@ -197,6 +215,12 @@ services:
         python.client.executable: python3
         python.executable: python3
         jobmanager.memory.process.size: 1024m
+        high-availability.type: zookeeper
+        high-availability.zookeeper.quorum: zookeeper:2181
+        # Flink's own tree, beside the pipeline's /pipeline on the same server.
+        high-availability.zookeeper.path.root: /flink
+        high-availability.cluster-id: /session
+        high-availability.storageDir: file:///opt/flink/ha
     healthcheck:
       # Healthy means "can run a job": the REST API answers and a taskmanager has
       # registered — not merely that a JVM started.
@@ -218,6 +242,12 @@ services:
         parallelism.default: 4
         execution.checkpointing.dir: file:///opt/flink/checkpoints
         taskmanager.memory.process.size: 1728m
+        high-availability.type: zookeeper
+        high-availability.zookeeper.quorum: zookeeper:2181
+        # Flink's own tree, beside the pipeline's /pipeline on the same server.
+        high-availability.zookeeper.path.root: /flink
+        high-availability.cluster-id: /session
+        high-availability.storageDir: file:///opt/flink/ha
 
 volumes:
   kafka-data:
@@ -226,3 +256,4 @@ volumes:
   zookeeper-data:
   zookeeper-datalog:
   flink-checkpoints:
+  flink-ha:
